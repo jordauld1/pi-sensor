@@ -1,205 +1,577 @@
-# Read air quality metrics from the PiicoDev Air Quality Sensor ENS160
-# Shows three metrics: AQI, TVOC and eCO2
-
 import math
 import logging
-from PiicoDev_SSD1306 import *  # import the OLED device driver
-from PiicoDev_ENS160 import PiicoDev_ENS160  # import the device driver
-from PiicoDev_BME280 import (
-    PiicoDev_BME280,
-)  # import the atmospheric sensor device driver
-from PiicoDev_TMP117 import PiicoDev_TMP117  # import TMP117 device driver
-from PiicoDev_Unified import sleep_ms  # a cross-platform sleep function
+import os
+import signal
+import sys
+import time
+from typing import Dict, Any, Tuple, List
+from collections import deque
+from datetime import datetime
+from statistics import mean, median
+
+from PiicoDev_SSD1306 import *
+from PiicoDev_ENS160 import PiicoDev_ENS160
+from PiicoDev_BME280 import PiicoDev_BME280
+from PiicoDev_TMP117 import PiicoDev_TMP117
+from PiicoDev_Unified import sleep_ms
 
 import influxdb_client
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+# Configuration
+CONFIG = {
+    'MEASUREMENT_INTERVAL_MS': 1000,  # How often to take measurements
+    'DISPLAY_PAGES': 6,              # Increased number of display pages
+    'INFLUXDB': {
+        'URL': "http://192.168.1.10:8086",
+        'ORG': "raider",
+        'BUCKET': "sensorData",
+        'TOKEN_ENV_VAR': "INFLUXDB_TOKEN",
+        'BATCH_SIZE': 60,            # Number of readings to batch before sending
+        'SEND_INTERVAL_SEC': 60,     # Send data every minute
+    },
+    'SENSOR_LOCATION': "bedroom3",   # Location tag for InfluxDB
+    'CACHE': {
+        'MAX_SIZE': 1000,           # Maximum number of readings to cache in RAM
+    },
+    'HEALTH_CHECK': {
+        'TEMP_RANGE': (-10, 50),     # Valid temperature range in Celsius
+        'HUMID_RANGE': (0, 100),     # Valid humidity range in %
+        'PRESSURE_RANGE': (900, 1100),  # Valid pressure range in hPa
+        'MAX_READING_AGE_SEC': 5,    # Maximum age of readings before considered stale
+        'ERROR_THRESHOLD': 3         # Number of errors before marking sensor as unhealthy
+    },
+    'ENS160': {
+        'TVOC_RANGE': (0, 65000),      # ppb (parts per billion)
+        'ECO2_RANGE': (400, 65000),    # ppm (parts per million)
+        'AQI_RATINGS': {               # Based on UBA guidelines
+            1: 'Excellent',
+            2: 'Good',
+            3: 'Moderate',
+            4: 'Poor',
+            5: 'Unhealthy'
+        },
+        'STATUS': {
+            'OK': "operating ok",
+            'ERROR': "error",
+            'WARMUP': "warm-up",
+            'STARTUP': "initial start-up",
+            'INVALID': "no valid output"
+        },
+        'DEFAULT_VALUES': {
+            'AQI': 1,
+            'TVOC': 0,
+            'ECO2': 400
+        }
+    },
+    'ENVIRONMENT_RATINGS': {
+        'CO2': {
+            'EXCELLENT': (400, 800),
+            'GOOD': (800, 1000),
+            'FAIR': (1000, 1500),
+            'POOR': (1500, 2000),
+            'DANGEROUS': (2000, 65000)
+        },
+        'HUMIDITY': {
+            'TOO_DRY': (0, 30),
+            'GOOD': (30, 60),
+            'TOO_HUMID': (60, 100)
+        },
+        'RECOMMENDATIONS': {
+            'HIGH_CO2': 'Open windows for fresh air',
+            'HIGH_HUMIDITY': 'Increase ventilation',
+            'LOW_HUMIDITY': 'Consider humidifier',
+            'POOR_AQI': 'Air purification recommended'
+        }
+    }
+}
+
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
-token = os.environ.get("INFLUXDB_TOKEN")
-org = "raider"
-url = "http://192.168.1.10:8086"
-bucket = "sensorData"
+class SensorHealth:
+    def __init__(self):
+        self.error_counts = {
+            'temp_sensor': 0,
+            'air_quality': 0,
+            'atmospheric': 0
+        }
+        self.last_readings = {
+            'temp_sensor': None,
+            'air_quality': None,
+            'atmospheric': None
+        }
+        self.last_reading_time = {
+            'temp_sensor': 0,
+            'air_quality': 0,
+            'atmospheric': 0
+        }
 
-# Initialize InfluxDB Client
-write_client = InfluxDBClient(url=url, token=token, org=org)
-write_api = write_client.write_api(write_options=SYNCHRONOUS)
+    def update_sensor_time(self, sensor_name):
+        self.last_reading_time[sensor_name] = time.time()
 
+    def increment_error(self, sensor_name):
+        self.error_counts[sensor_name] += 1
+        logger.warning(f"{sensor_name} error count: {self.error_counts[sensor_name]}")
 
-# Initialize sensors and display
-def init_devices():
-    temp_sensor = PiicoDev_TMP117()  # initialise the precision temperature sensor
-    air_quality_sensor = PiicoDev_ENS160()  # Initialise the ENS160 air quality sensor
-    atmospheric_sensor = PiicoDev_BME280()  # initialise the atmospheric sensor
-    display = create_PiicoDev_SSD1306()  # initialise the OLED display driver
-    return temp_sensor, air_quality_sensor, atmospheric_sensor, display
+    def reset_error(self, sensor_name):
+        if self.error_counts[sensor_name] > 0:
+            self.error_counts[sensor_name] = 0
+            logger.info(f"Reset error count for {sensor_name}")
 
+    def is_sensor_healthy(self, sensor_name) -> bool:
+        return self.error_counts[sensor_name] < CONFIG['HEALTH_CHECK']['ERROR_THRESHOLD']
 
-def write_to_influx(temperature, humidity, pres_hPa, aqi, aqiRating, tvoc, eco2, eco2Rating, sensorStatus):
-    try:
-        point = (
-            Point("sensorReading")
-            .tag("sensor", "PiicoDevSensors")
-            .tag("location", "bedroom3")
-            .field("temperature", temperature)
-            .field("humidity", humidity)
-            .field("pressure", pres_hPa)
-            .field("aqi", aqi)
-            .field("tvoc", tvoc)
-            .field("eco2", eco2)
-            .field("aqi_rating", aqiRating)
-            .field("eco2_rating", eco2Rating)
-            .field("sensor_status", sensorStatus)
-        )
-        write_api.write(bucket=bucket, org=org, record=point)
-    except Exception as e:
-        logging.error("Error writing to InfluxDB: %s", e)
+    def is_reading_fresh(self, sensor_name) -> bool:
+        age = time.time() - self.last_reading_time[sensor_name]
+        return age < CONFIG['HEALTH_CHECK']['MAX_READING_AGE_SEC']
 
+    def validate_reading(self, reading_type: str, value: float) -> bool:
+        if reading_type == 'temperature':
+            return CONFIG['HEALTH_CHECK']['TEMP_RANGE'][0] <= value <= CONFIG['HEALTH_CHECK']['TEMP_RANGE'][1]
+        elif reading_type == 'humidity':
+            return CONFIG['HEALTH_CHECK']['HUMID_RANGE'][0] <= value <= CONFIG['HEALTH_CHECK']['HUMID_RANGE'][1]
+        elif reading_type == 'pressure':
+            return CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][0] <= value <= CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][1]
+        return True
 
-# Air Quality signal characteristics
-# TVOC: 0 - 65,000 ppb
-# eCO2: 400 - 65,000 ppm CO2 equiv.
-# AQI-UBA: 1 to 5
+    def validate_sensor_reading(self, sensor_type: str, value: Any) -> bool:
+        if sensor_type == 'tvoc':
+            return CONFIG['ENS160']['TVOC_RANGE'][0] <= value <= CONFIG['ENS160']['TVOC_RANGE'][1]
+        elif sensor_type == 'eco2':
+            return CONFIG['ENS160']['ECO2_RANGE'][0] <= value <= CONFIG['ENS160']['ECO2_RANGE'][1]
+        elif sensor_type == 'aqi':
+            return isinstance(value, int) and 1 <= value <= 5
+        return True
 
-
-# Read sensor data
-def read_sensors(temp_sensor, air_quality_sensor, atmospheric_sensor):
-    tempC, presPa, humRH = atmospheric_sensor.values()
-    # atmospheric sensor temp is not super accurate, so use the TMP117 instead
-    pres_hPa = presPa / 100  # Convert Pascals to hPa
-
-    tempC_tempSensor = temp_sensor.readTempC()
-    # tempF = temp_sensor.readTempF()  # Farenheit
-    # tempK = temp_sensor.readTempK()  # Kelvin
-
-    # Set Air Quality Sensor temp and humidity params (ENS160)
-    air_quality_sensor.temperature = tempC_tempSensor
-    air_quality_sensor.humidity = humRH
-
-    aqi = air_quality_sensor.aqi
-    tvoc = air_quality_sensor.tvoc
-    eco2 = air_quality_sensor.eco2
-
-    return {
-        "tempC": tempC_tempSensor,
-        "pres_hPa": pres_hPa,
-        "humRH": humRH,
-        "aqi": aqi.value,
-        "aqi_rating": aqi.rating,
-        "tvoc": tvoc,
-        "eco2": eco2.value,
-        "eco2_rating": eco2.rating,
-        "sensor_status": air_quality_sensor.operation,
-    }
-
-
-# Update console
-def update_console(sensor_data):
-    print(
-        f"Temp: {sensor_data['tempC']} °C, Press: {sensor_data['pres_hPa']} hPa, Humid: {sensor_data['humRH']} %RH"
-    )
-    print(
-        f"AQI: {sensor_data['aqi']}, TVOC: {sensor_data['tvoc']} ppb, eCO2: {sensor_data['eco2']} ppm"
-    )
-    print(f"Sensor Status: {sensor_data['sensor_status']}")
-    print("--------------------------------")
-
-
-def update_display(display, sensor_data, page=0):
-    display.fill(0)  # Clear the display
-
-    if page == 0:
-        # First page: Temperature, Humidity, Pressure
-        display.text(f"Temp: {sensor_data['tempC']}C", 0, 0, 1)
-        display.text(f"Humid: {sensor_data['humRH']}%", 0, 10, 1)
-        display.text(f"Press: {sensor_data['pres_hPa']}hPa", 0, 20, 1)
-        display.text(
-            f"AQI: {sensor_data['aqi']}" + " [" + str(sensor_data["aqi_rating"]) + "]",
-            0,
-            30,
-            1,
-        )
-        display.text(f"TVOC: {sensor_data['tvoc']}ppb", 0, 40, 1)
-        display.text(
-            f"eCO2: {sensor_data['eco2']}ppm"
-            + " ["
-            + str(sensor_data["eco2_rating"])
-            + "]",
-            0,
-            50,
-            1,
-        )
-
-    # elif page == 1:
-    # Third page: Other metrics or messages
-    # display.text(f"Sensor Status: {sensor_data['sensor_status']}", 0, 0, 1)
-
-    display.show()
-
-
-# Main program loop
-def main():
-    temp_sensor, air_quality_sensor, atmospheric_sensor, display = init_devices()
-    page = 0
-    while True:
-        try:
-            sensor_data = read_sensors(
-                temp_sensor, air_quality_sensor, atmospheric_sensor
-            )
-            update_console(sensor_data)
-            update_display(display, sensor_data, page)
-
-            write_to_influx(
-                sensor_data["tempC"],
-                sensor_data["humRH"],
-                sensor_data["pres_hPa"],
-                sensor_data["aqi"],
-                sensor_data["aqi_rating"],
-                sensor_data["tvoc"],
-                sensor_data["eco2"],
-                sensor_data["eco2_rating"],
-                sensor_data["sensor_status"],
-            )
-
-            # page = (page + 1) % 2  # Cycle through 2 pages
-            sleep_ms(1000)
-        except Exception as e:
-            print(f"Error: {e}")
-
-        """
-        pres_hPa = presPa / 100  # convert Pascals to hPa (mbar)
-
-        # Read and print the temperature in various units
-        tempC = temp_sensor.readTempC()  # Celsius
-        tempF = temp_sensor.readTempF()  # Farenheit
-        tempK = temp_sensor.readTempK()  # Kelvin
-
-        # Set Air Quality Sensor temp and humidity params
+class EnvironmentAnalyzer:
+    @staticmethod
+    def get_environment_score(sensor_data: Dict[str, Any]) -> Tuple[str, List[str]]:
+        # Use the actual AQI rating from ENS160 as our base score
+        base_score = sensor_data['aqi_rating']
+        recommendations = []
         
-        air_quality_sensor.temperature = tempC  # [degC]
-        air_quality_sensor.humidity = humRH  # [%RH]
-				
-        # Read from the sensor
-        aqi = air_quality_sensor.aqi
-        tvoc = air_quality_sensor.tvoc
-        eco2 = air_quality_sensor.eco2
+        # Check CO2 levels using ENS160's eCO2 ranges
+        eco2 = sensor_data['eco2']
+        if eco2 > 2000:
+            recommendations.append('Ventilate immediately')
+        elif eco2 > 1500:
+            recommendations.append('Open windows for fresh air')
+        elif eco2 > 1000:
+            recommendations.append('Consider ventilation')
+            
+        # Check TVOC levels
+        tvoc = sensor_data['tvoc']
+        if tvoc > 10000:  # Very high TVOC
+            recommendations.append('Air purification needed')
+        elif tvoc > 5000:  # Elevated TVOC
+            recommendations.append('Increase ventilation')
+            
+        # Add humidity-based recommendations only if other issues aren't more pressing
+        humidity = sensor_data['humRH']
+        if len(recommendations) < 2:  # Only add if we have room
+            if humidity < 30:
+                recommendations.append('Air too dry')
+            elif humidity > 60:
+                recommendations.append('Reduce humidity')
+        
+        return base_score, list(set(recommendations))[:2]  # Return up to 2 unique recommendations
 
-        # Print air temperature metrics
-        print("   Temp: " + str(tempC) + " °C")
-        print("  Press: " + str(pres_hPa) + " hPa")
-        print("  Humid: " + str(humRH) + " %RH")
-        # Print air quality metrics
-        print("    AQI: " + str(aqi.value) + " [" + str(aqi.rating) + "]")
-        print("   TVOC: " + str(tvoc) + " ppb")
-        print("   eCO2: " + str(eco2.value) + " ppm [" + str(eco2.rating) + "]")
-        print(" Sensor Status: " + air_quality_sensor.operation)
+class SensorManager:
+    def __init__(self):
+        self.temp_sensor = None
+        self.air_quality_sensor = None
+        self.atmospheric_sensor = None
+        self.display = None
+        self.influx_client = None
+        self.write_api = None
+        self.running = True
+        self.data_cache = deque(maxlen=CONFIG['CACHE']['MAX_SIZE'])
+        self.last_influx_send = 0
+        self.health = SensorHealth()
+        self.error_history = []
+        self.reading_history = deque(maxlen=60)
+        self.environment_analyzer = EnvironmentAnalyzer()
+
+    def init_influxdb(self):
+        token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
+        if not token:
+            raise ValueError(f"Missing {CONFIG['INFLUXDB']['TOKEN_ENV_VAR']} environment variable")
+        
+        self.influx_client = InfluxDBClient(
+            url=CONFIG['INFLUXDB']['URL'],
+            token=token,
+            org=CONFIG['INFLUXDB']['ORG']
+        )
+        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
+        logger.info("InfluxDB client initialized successfully")
+
+    def init_devices(self):
+        try:
+            self.temp_sensor = PiicoDev_TMP117()
+            self.air_quality_sensor = PiicoDev_ENS160()
+            self.atmospheric_sensor = PiicoDev_BME280()
+            self.display = create_PiicoDev_SSD1306()
+            logger.info("All sensors initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize devices: {e}")
+            raise
+
+    def cleanup(self):
+        logger.info("Cleaning up resources...")
+        if self.display:
+            self.display.fill(0)
+            self.display.text("Shutting down...", 0, 20, 1)
+            self.display.show()
+        if self.influx_client:
+            self.flush_cache()  # Try to send remaining data
+            self.influx_client.close()
+        self.running = False
+
+    def validate_data_point(self, data: Dict[str, Any]) -> bool:
+        """Validate sensor data against documented ranges before sending to InfluxDB"""
+        try:
+            # First check operational status
+            if data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
+                logger.warning(f"ENS160 not ready: {data['sensor_status']}")
+                return False
+                
+            # Temperature validation
+            if not CONFIG['HEALTH_CHECK']['TEMP_RANGE'][0] <= data['tempC'] <= CONFIG['HEALTH_CHECK']['TEMP_RANGE'][1]:
+                return False
+                
+            # ENS160 validations based on documentation
+            if not (CONFIG['ENS160']['TVOC_RANGE'][0] <= data['tvoc'] <= CONFIG['ENS160']['TVOC_RANGE'][1]):
+                return False
+                
+            if not (CONFIG['ENS160']['ECO2_RANGE'][0] <= data['eco2'] <= CONFIG['ENS160']['ECO2_RANGE'][1]):
+                return False
+                
+            # AQI must be 1-5 per ENS160 docs
+            if not (1 <= data['aqi'] <= len(CONFIG['ENS160']['AQI_RATINGS'])):
+                return False
+                
+            # Basic range checks for atmospheric data
+            if not (0 <= data['humRH'] <= 100):
+                return False
+                
+            if not (CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][0] <= data['pres_hPa'] <= CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][1]):
+                return False
+                
+            return True
+        except (KeyError, TypeError):
+            return False
+
+    def write_to_influx(self, sensor_data: Dict[str, Any]):
+        """Add data to cache and potentially send to InfluxDB"""
+        if self.validate_data_point(sensor_data):
+            self.data_cache.append(sensor_data)
+            
+            current_time = time.time()
+            if (current_time - self.last_influx_send >= CONFIG['INFLUXDB']['SEND_INTERVAL_SEC'] and 
+                len(self.data_cache) >= CONFIG['INFLUXDB']['BATCH_SIZE']):
+                self.flush_cache()
+        else:
+            logger.warning("Invalid sensor data point detected, skipping InfluxDB storage")
+
+    def flush_cache(self):
+        """Attempt to send all cached data to InfluxDB"""
+        if not self.data_cache:
+            return
+
+        try:
+            points = []
+            for data in self.data_cache:
+                point = (
+                    Point("sensorReading")
+                    .tag("sensor", "PiicoDevSensors")
+                    .tag("location", CONFIG['SENSOR_LOCATION'])
+                    .field("temperature", data['tempC'])
+                    .field("humidity", data['humRH'])
+                    .field("pressure", data['pres_hPa'])
+                    .field("aqi", data['aqi'])
+                    .field("tvoc", data['tvoc'])
+                    .field("eco2", data['eco2'])
+                    .field("aqi_rating", data['aqi_rating'])
+                    .field("eco2_rating", data['eco2_rating'])
+                    .field("sensor_status", data['sensor_status'])
+                )
+                points.append(point)
+
+            self.write_api.write(
+                bucket=CONFIG['INFLUXDB']['BUCKET'],
+                org=CONFIG['INFLUXDB']['ORG'],
+                record=points
+            )
+            
+            self.data_cache.clear()
+            self.last_influx_send = time.time()
+            logger.info(f"Successfully sent {len(points)} readings to InfluxDB")
+        except Exception as e:
+            logger.error(f"Error writing to InfluxDB: {e}")
+            # Data remains in cache for next attempt
+
+    def read_sensors(self) -> Dict[str, Any]:
+        try:
+            tempC, presPa, humRH = self.atmospheric_sensor.values()
+            self.health.update_sensor_time('atmospheric')
+            
+            if not all(self.health.validate_reading(t, v) for t, v in [
+                ('temperature', tempC),
+                ('humidity', humRH),
+                ('pressure', presPa/100)
+            ]):
+                self.health.increment_error('atmospheric')
+            else:
+                self.health.reset_error('atmospheric')
+        except Exception as e:
+            self.health.increment_error('atmospheric')
+            logger.error(f"Atmospheric sensor error: {e}")
+            tempC, presPa, humRH = self.health.last_readings.get('atmospheric', (20, 101325, 50))
+
+        try:
+            tempC_tempSensor = self.temp_sensor.readTempC()
+            self.health.update_sensor_time('temp_sensor')
+            
+            if not self.health.validate_reading('temperature', tempC_tempSensor):
+                self.health.increment_error('temp_sensor')
+            else:
+                self.health.reset_error('temp_sensor')
+        except Exception as e:
+            self.health.increment_error('temp_sensor')
+            logger.error(f"Temperature sensor error: {e}")
+            tempC_tempSensor = tempC
+
+        # Initialize air quality variables with defaults
+        aqi = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['AQI'], 
+                              'rating': CONFIG['ENS160']['AQI_RATINGS'][CONFIG['ENS160']['DEFAULT_VALUES']['AQI']]})()
+        tvoc = CONFIG['ENS160']['DEFAULT_VALUES']['TVOC']
+        eco2 = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['ECO2'], 
+                               'rating': 'Normal'})()
+        sensor_status = CONFIG['ENS160']['STATUS']['ERROR']
+
+        try:
+            # Update ENS160 with current temperature and humidity for compensation
+            self.air_quality_sensor.temperature = tempC_tempSensor
+            self.air_quality_sensor.humidity = humRH
+            
+            # Check operational status
+            sensor_status = self.air_quality_sensor.operation
+            if sensor_status != CONFIG['ENS160']['STATUS']['OK']:
+                logger.info(f"ENS160 not ready: {sensor_status}")
+                raise ValueError(f"ENS160 not operating correctly: {sensor_status}")
+            
+            aqi = self.air_quality_sensor.aqi
+            tvoc = self.air_quality_sensor.tvoc
+            eco2 = self.air_quality_sensor.eco2
+            
+            # Validate readings against documented ranges
+            if not all(self.health.validate_sensor_reading(t, v) for t, v in [
+                ('tvoc', tvoc),
+                ('eco2', eco2.value),
+                ('aqi', aqi.value)
+            ]):
+                self.health.increment_error('air_quality')
+            else:
+                self.health.reset_error('air_quality')
+                
+            self.health.update_sensor_time('air_quality')
+        except Exception as e:
+            self.health.increment_error('air_quality')
+            logger.error(f"Air quality sensor error: {e}")
+            if self.health.last_readings.get('air_quality'):
+                aqi, tvoc, eco2 = self.health.last_readings['air_quality']
+
+        reading = {
+            "tempC": tempC_tempSensor,
+            "pres_hPa": presPa / 100,
+            "humRH": humRH,
+            "aqi": aqi.value,
+            "aqi_rating": CONFIG['ENS160']['AQI_RATINGS'].get(aqi.value, 'Unknown'),
+            "tvoc": tvoc,
+            "eco2": eco2.value,
+            "eco2_rating": eco2.rating,
+            "sensor_status": sensor_status,
+            "timestamp": time.time()
+        }
+
+        # Only store history if sensor is operating correctly
+        if sensor_status == CONFIG['ENS160']['STATUS']['OK']:
+            self.reading_history.append(reading)
+            self.health.last_readings['atmospheric'] = (tempC, presPa, humRH)
+            self.health.last_readings['temp_sensor'] = tempC_tempSensor
+            self.health.last_readings['air_quality'] = (aqi, tvoc, eco2)
+
+        return reading
+
+    def create_simple_graph(self, values, width=128, height=20, min_val=None, max_val=None):
+        if not values:
+            return [0] * width
+        
+        if min_val is None:
+            min_val = min(values)
+        if max_val is None:
+            max_val = max(values)
+        
+        value_range = max_val - min_val
+        if value_range == 0:
+            value_range = 1
+            
+        graph = []
+        for val in values[-width:]:
+            normalized = (val - min_val) / value_range
+            graph_val = int(normalized * (height - 1))
+            graph.append(graph_val)
+        
+        return graph + [0] * (width - len(graph))
+
+    def get_sensor_health_status(self):
+        status = []
+        for sensor in ['temp_sensor', 'air_quality', 'atmospheric']:
+            healthy = self.health.is_sensor_healthy(sensor)
+            fresh = self.health.is_reading_fresh(sensor)
+            status.append({
+                'name': sensor,
+                'healthy': healthy,
+                'fresh': fresh,
+                'errors': self.health.error_counts[sensor]
+            })
+        return status
+
+    def update_console(self, sensor_data):
+        print(
+            f"Temp: {sensor_data['tempC']} °C, Press: {sensor_data['pres_hPa']} hPa, Humid: {sensor_data['humRH']} %RH"
+        )
+        print(
+            f"AQI: {sensor_data['aqi']}, TVOC: {sensor_data['tvoc']} ppb, eCO2: {sensor_data['eco2']} ppm"
+        )
+        print(f"Sensor Status: {sensor_data['sensor_status']}")
         print("--------------------------------")
-        """
 
+    def update_display(self, display, sensor_data, page=0):
+        display.fill(0)
+
+        if page == 0:
+            # Main readings page
+            display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 0, 1)
+            display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 10, 1)
+            display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 20, 1)
+            
+            if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
+                status_msg = "Status:"
+                display.text(status_msg, 0, 30, 1)
+                # Show specific status message
+                if sensor_data['sensor_status'] in CONFIG['ENS160']['STATUS'].values():
+                    display.text(f"{sensor_data['sensor_status']}", 0, 40, 1)
+                else:
+                    display.text("Unknown", 0, 40, 1)
+            else:
+                display.text("Air Quality:", 0, 30, 1)
+                display.text(f"{sensor_data['aqi_rating']}", 0, 40, 1)
+
+        elif page == 1:
+            # Air quality details
+            display.text("Air Quality Data", 0, 0, 1)
+            if sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
+                display.text(f"AQI: {sensor_data['aqi']}/5", 0, 15, 1)
+                display.text(f"TVOC:{sensor_data['tvoc']}ppb", 0, 25, 1)
+                eco2_val = sensor_data['eco2']
+                if eco2_val > 9999:  # Handle large numbers
+                    display.text(f"CO2:{eco2_val//1000}k", 0, 35, 1)
+                else:
+                    display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
+            else:
+                display.text("Sensor not ready", 0, 25, 1)
+                display.text(f"{sensor_data['sensor_status']}", 0, 35, 1)
+
+        elif page == 2:
+            # Temperature history
+            display.text("Temp History", 0, 0, 1)
+            temp_values = [r['tempC'] for r in self.reading_history]
+            if temp_values:
+                graph = self.create_simple_graph(temp_values, height=40)
+                for i, val in enumerate(graph):
+                    display.pixel(i, 63-val, 1)
+                display.text(f"L:{min(temp_values):.1f}", 0, 55, 1)
+                display.text(f"H:{max(temp_values):.1f}", 64, 55, 1)
+
+        elif page == 3:
+            # Sensor health status
+            display.text("Sensor Health", 0, 0, 1)
+            health_status = self.get_sensor_health_status()
+            y = 12
+            for status in health_status:
+                icon = "✓" if status['healthy'] and status['fresh'] else "✗"
+                name = status['name'][:12]  # Truncate long names
+                display.text(f"{icon} {name}", 0, y, 1)
+                if status['errors'] > 0:
+                    display.text(f"Err:{status['errors']}", 70, y, 1)
+                y += 10
+
+        elif page == 4:
+            # Environment recommendations
+            env_score, recommendations = self.environment_analyzer.get_environment_score(sensor_data)
+            display.text("Air Quality", 0, 0, 1)
+            display.text(f"Level: {env_score}", 0, 12, 1)
+            
+            if recommendations:
+                y = 25
+                for i, rec in enumerate(recommendations[:2]):
+                    words = rec.split()
+                    line = ""
+                    line2 = ""
+                    for word in words:
+                        if len(line + word) < 16:
+                            line += word + " "
+                        else:
+                            line2 += word + " "
+                    display.text(line.strip(), 0, y, 1)
+                    if line2:
+                        y += 10
+                        display.text(line2.strip(), 0, y, 1)
+                    y += 12
+
+        display.show()
+
+    def run(self):
+        page = 0
+        while self.running:
+            try:
+                sensor_data = self.read_sensors()
+                self.update_console(sensor_data)
+                self.update_display(self.display, sensor_data, page)
+                self.write_to_influx(sensor_data)
+                
+                page = (page + 1) % CONFIG['DISPLAY_PAGES']
+                sleep_ms(CONFIG['MEASUREMENT_INTERVAL_MS'])
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                sleep_ms(5000)  # Wait before retrying
+
+def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}")
+    if sensor_manager:
+        sensor_manager.cleanup()
+    sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    sensor_manager = None
+    try:
+        sensor_manager = SensorManager()
+        sensor_manager.init_influxdb()
+        sensor_manager.init_devices()
+        logger.info("Starting sensor monitoring...")
+        sensor_manager.run()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        if sensor_manager:
+            sensor_manager.cleanup()
+        sys.exit(1)
