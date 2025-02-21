@@ -236,6 +236,7 @@ class SensorManager:
         self.health = SensorHealth()
         self.error_history = []
         self.reading_history = deque(maxlen=128)  # Match display width for graphing
+        self.temp_graph = None  # Will be initialized when display is ready
         self.environment_analyzer = EnvironmentAnalyzer()
         self.current_page = 0
 
@@ -259,6 +260,12 @@ class SensorManager:
             self.air_quality_sensor = PiicoDev_ENS160()
             self.atmospheric_sensor = PiicoDev_BME280()
             self.display = create_PiicoDev_SSD1306()
+            # Initialize the temperature graph with appropriate min/max values
+            self.temp_graph = self.display.graph2D(
+                minValue=15,  # Typical indoor minimum temperature
+                maxValue=30,  # Typical indoor maximum temperature
+                height=35     # Leave space for labels
+            )
             
             # Show initialization message
             self.display.fill(0)
@@ -519,23 +526,9 @@ class SensorManager:
     def update_display(self, display, sensor_data, page=0):
         try:
             display.fill(0)
-
-            # Add page indicator at bottom of every page
-            total_pages = CONFIG['DISPLAY']['PAGES']
-            page_indicator = f"{page + 1}/{total_pages}"
-            display.text(page_indicator, 110, 0, 1)  # Top right corner
-
-            # Skip health status page if all sensors are healthy
-            health_status = self.get_sensor_health_status()
-            all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0 
-                            for status in health_status)
-
-            # Adjust page if health page should be skipped
-            if page == 3 and all_healthy:
-                page = 4  # Skip to environment page
             
             if page == 0:
-                # Main readings page with basic ASCII
+                # Main readings page (no changes)
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 12, 1)
                 display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 22, 1)
@@ -569,55 +562,26 @@ class SensorManager:
             elif page == 2:
                 # Temperature history graph
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
-                
-                # Show current temperature with better spacing
                 temp = sensor_data['tempC']
-                display.text(f"{temp:.1f}C", 90, 0, 1)  # Moved to far right
+                display.text(f"{temp:.1f}C", 90, 0, 1)
                 
-                # Draw graph area with better spacing
-                graph_top = 15     # Start below the title
-                graph_height = 35  # Leave space for min/max at bottom
-                
-                # Draw axes with proper spacing
-                display.hline(10, graph_top + graph_height, 108, 1)  # x-axis
-                display.vline(10, graph_top, graph_height, 1)        # y-axis
-                
-                # Plot temperature history if we have data
+                # Update and draw the temperature graph
+                if self.temp_graph is not None:
+                    display.updateGraph2D(self.temp_graph, temp)
+                    
+                # Show min/max from reading history
                 if self.reading_history:
                     temp_values = [r['tempC'] for r in self.reading_history]
                     min_temp = min(temp_values)
                     max_temp = max(temp_values)
-                    temp_range = max_temp - min_temp
-                    
-                    # Ensure minimum range of 5 degrees for better visualization
-                    if temp_range < 5:
-                        mid = (max_temp + min_temp) / 2
-                        min_temp = mid - 2.5
-                        max_temp = mid + 2.5
-                        temp_range = 5
-                    
-                    # Plot the line graph
-                    last_x = None
-                    last_y = None
-                    
-                    for i, reading in enumerate(self.reading_history):
-                        temp = reading['tempC']
-                        # Scale x from 0-108 (graph width)
-                        x = 10 + int((i * 108) / len(self.reading_history))
-                        # Scale y from 0-35 (graph height), invert because display coordinates
-                        y = graph_top + graph_height - int(((temp - min_temp) * graph_height) / temp_range)
-                        
-                        if last_x is not None:
-                            display.line(last_x, last_y, x, y, 1)
-                        last_x = x
-                        last_y = y
-                    
-                    # Show min/max with better spacing
                     display.text(f"L:{min_temp:.1f}", 0, 55, 1)
                     display.text(f"H:{max_temp:.1f}", 64, 55, 1)
 
             elif page == 3:
                 # Only show health status page if there are issues
+                health_status = self.get_sensor_health_status()
+                all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0 
+                                for status in health_status)
                 if not all_healthy:
                     display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                     y = 15
