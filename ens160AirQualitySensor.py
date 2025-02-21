@@ -192,22 +192,20 @@ class EnvironmentAnalyzer:
         elif humidity < 40:
             recommendations.append('Slightly dry')
         elif humidity > 70:
-            recommendations.append('Very humid: dry')
+            recommendations.append('Very humid: dehumidify')
         elif humidity > 60:
             recommendations.append('Getting humid')
             
         # Temperature comfort recommendations
         temp = sensor_data['tempC']
-        if temp > 25:
+        if temp > 26:
             recommendations.append('Space too warm')
-        elif temp < 18:
+        elif temp < 17:
             recommendations.append('Space too cool')
             
         # Add AQI-based recommendations
         if sensor_data['aqi'] >= 4:
             recommendations.append('Poor air: purify!')
-        elif sensor_data['aqi'] == 3:
-            recommendations.append('Air getting worse')
             
         return base_score, list(set(recommendations))[:2]  # Return up to 2 unique recommendations
 
