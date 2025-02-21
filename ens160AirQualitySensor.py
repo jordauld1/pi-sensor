@@ -84,7 +84,18 @@ CONFIG = {
             'LOW_HUMIDITY': 'Consider humidifier',
             'POOR_AQI': 'Air purification recommended'
         }
-    }
+    },
+    'DISPLAY': {
+        'PAGES': 5,           # Total number of pages (0-4)
+        'PAGE_TITLES': [
+            'Main Stats',      # Page 0
+            'Air Quality',     # Page 1
+            'Temp Graph',      # Page 2
+            'Sensor Health',   # Page 3
+            'Environment'      # Page 4
+        ],
+        'UPDATE_INTERVAL_SEC': 3  # Seconds between page changes
+    },
 }
 
 # Configure logging
@@ -447,25 +458,30 @@ class SensorManager:
         try:
             display.fill(0)
 
+            # Add page indicator at bottom of every page
+            total_pages = CONFIG['DISPLAY']['PAGES']
+            page_indicator = f"{page + 1}/{total_pages}"
+            display.text(page_indicator, 110, 0, 1)  # Top right corner
+
             if page == 0:
-                # Main readings page
-                display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 0, 1)
-                display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 10, 1)
-                display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 20, 1)
+                # Main readings page with basic ASCII
+                display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
+                display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 12, 1)
+                display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 22, 1)
+                display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 32, 1)
                 
                 if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
-                    display.text("Status:", 0, 30, 1)
-                    if sensor_data['sensor_status'] in CONFIG['ENS160']['STATUS'].values():
-                        display.text(f"{sensor_data['sensor_status']}", 0, 40, 1)
-                    else:
-                        display.text("Unknown", 0, 40, 1)
+                    display.text("Status:", 0, 42, 1)
+                    status_text = sensor_data['sensor_status'][:16]
+                    display.text(status_text, 0, 52, 1)
                 else:
-                    display.text("Air Quality:", 0, 30, 1)
-                    display.text(f"{sensor_data['aqi_rating']}", 0, 40, 1)
+                    display.text("Air Quality:", 0, 42, 1)
+                    rating_text = sensor_data['aqi_rating'][:16]
+                    display.text(rating_text, 0, 52, 1)
 
             elif page == 1:
                 # Air quality details
-                display.text("Air Quality Data", 0, 0, 1)
+                display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 if sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
                     display.text(f"AQI: {sensor_data['aqi']}/5", 0, 15, 1)
                     display.text(f"TVOC:{sensor_data['tvoc']}ppb", 0, 25, 1)
@@ -476,36 +492,32 @@ class SensorManager:
                         display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
                 else:
                     display.text("Sensor not ready", 0, 25, 1)
-                    display.text(f"{sensor_data['sensor_status']}", 0, 35, 1)
+                    status_text = sensor_data['sensor_status'][:16]
+                    display.text(status_text, 0, 35, 1)
 
             elif page == 2:
                 # Temperature history graph
-                display.text("Temp History", 0, 0, 1)
+                display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 
                 # Draw axes
                 display.hline(0, 63, 128, 1)  # x-axis
                 display.vline(0, 15, 48, 1)   # y-axis
                 
-                # Plot temperature points if we have history
                 if self.reading_history:
                     temp_values = [r['tempC'] for r in self.reading_history]
-                    
-                    # Calculate scale for better visualization
                     min_temp = min(temp_values)
                     max_temp = max(temp_values)
                     temp_range = max_temp - min_temp
                     if temp_range == 0:
-                        temp_range = 1  # Prevent division by zero
+                        temp_range = 1
                     
-                    # Plot each point
                     for i, temp in enumerate(temp_values):
-                        if i >= 128:  # Stay within display width
+                        if i >= 128:
                             break
-                        # Scale temperature to fit in our 48-pixel height
                         y_pos = 63 - int(((temp - min_temp) / temp_range) * 40)
+                        y_pos = max(0, min(63, y_pos))
                         display.pixel(i, y_pos, 1)
                     
-                    # Show min/max values
                     display.text(f"L:{min_temp:.1f}", 0, 55, 1)
                     display.text(f"H:{max_temp:.1f}", 64, 55, 1)
                 else:
@@ -513,45 +525,42 @@ class SensorManager:
 
             elif page == 3:
                 # Sensor health status
-                display.text("Sensor Health", 0, 0, 1)
+                display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 health_status = self.get_sensor_health_status()
-                y = 12
+                y = 15  # Start a bit lower to accommodate title
                 for status in health_status:
-                    icon = "✓" if status['healthy'] and status['fresh'] else "✗"
-                    name = status['name'][:12]  # Truncate long names
+                    icon = "+" if status['healthy'] and status['fresh'] else "x"
+                    name = status['name'][:12]
                     display.text(f"{icon} {name}", 0, y, 1)
                     if status['errors'] > 0:
                         display.text(f"Err:{status['errors']}", 70, y, 1)
-                    y += 10
+                    y += 12
 
             elif page == 4:
                 # Environment recommendations
+                display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 env_score, recommendations = self.environment_analyzer.get_environment_score(sensor_data)
-                display.text("Air Quality", 0, 0, 1)
-                display.text(f"Level: {env_score}", 0, 12, 1)
+                
+                score_text = f"Level: {env_score}"[:16]
+                display.text(score_text, 0, 15, 1)
                 
                 if recommendations:
-                    y = 25
-                    for i, rec in enumerate(recommendations[:2]):
-                        words = rec.split()
-                        line = ""
-                        line2 = ""
-                        for word in words:
-                            if len(line + word) < 16:
-                                line += word + " "
-                            else:
-                                line2 += word + " "
-                        display.text(line.strip(), 0, y, 1)
-                        if line2:
-                            y += 10
-                            display.text(line2.strip(), 0, y, 1)
-                        y += 12
+                    y = 27
+                    for rec in recommendations[:2]:
+                        # Split long recommendations
+                        if len(rec) > 16:
+                            display.text(rec[:16], 0, y, 1)
+                            if len(rec) > 16:
+                                display.text(rec[16:32], 0, y + 10, 1)
+                                y += 20
+                        else:
+                            display.text(rec, 0, y, 1)
+                            y += 12
 
             display.show()
             
         except Exception as e:
             logger.error(f"Display update error on page {page}: {e}")
-            # Simple error recovery - just clear the display
             try:
                 display.fill(0)
                 display.show()
@@ -568,14 +577,19 @@ class SensorManager:
                 
                 # Update display with error handling
                 try:
+                    # Ensure page number is valid
+                    valid_pages = 5  # We have pages 0-4
+                    self.current_page = self.current_page % valid_pages
+                    
                     self.update_display(self.display, sensor_data, self.current_page)
                     # Change page every 3 seconds
                     if current_time - page_update_time >= 3:
-                        self.current_page = (self.current_page + 1) % CONFIG['DISPLAY_PAGES']
+                        self.current_page = (self.current_page + 1) % valid_pages
                         page_update_time = current_time
                 except Exception as e:
                     logger.error(f"Display error: {e}")
                     self.current_page = 0  # Reset to main page on error
+                    self.reset_display()
                 
                 self.write_to_influx(sensor_data)
                 sleep_ms(CONFIG['MEASUREMENT_INTERVAL_MS'])
