@@ -195,8 +195,9 @@ class SensorManager:
         self.last_influx_send = 0
         self.health = SensorHealth()
         self.error_history = []
-        self.reading_history = deque(maxlen=60)
+        self.reading_history = deque(maxlen=128)  # Match display width for graphing
         self.environment_analyzer = EnvironmentAnalyzer()
+        self.current_page = 0
 
     def init_influxdb(self):
         token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
@@ -409,27 +410,6 @@ class SensorManager:
 
         return reading
 
-    def create_simple_graph(self, values, width=128, height=20, min_val=None, max_val=None):
-        if not values:
-            return [0] * width
-        
-        if min_val is None:
-            min_val = min(values)
-        if max_val is None:
-            max_val = max(values)
-        
-        value_range = max_val - min_val
-        if value_range == 0:
-            value_range = 1
-            
-        graph = []
-        for val in values[-width:]:
-            normalized = (val - min_val) / value_range
-            graph_val = int(normalized * (height - 1))
-            graph.append(graph_val)
-        
-        return graph + [0] * (width - len(graph))
-
     def get_sensor_health_status(self):
         status = []
         for sensor in ['temp_sensor', 'air_quality', 'atmospheric']:
@@ -453,101 +433,151 @@ class SensorManager:
         print(f"Sensor Status: {sensor_data['sensor_status']}")
         print("--------------------------------")
 
+    def reset_display(self):
+        """Reset display and graph if errors occur"""
+        try:
+            self.display.fill(0)
+            self.display.show()
+            sleep_ms(100)  # Brief pause to ensure display is cleared
+            logger.info("Display reset successfully")
+        except Exception as e:
+            logger.error(f"Critical display error: {e}")
+
     def update_display(self, display, sensor_data, page=0):
-        display.fill(0)
+        try:
+            display.fill(0)
 
-        if page == 0:
-            # Main readings page
-            display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 0, 1)
-            display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 10, 1)
-            display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 20, 1)
-            
-            if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
-                status_msg = "Status:"
-                display.text(status_msg, 0, 30, 1)
-                # Show specific status message
-                if sensor_data['sensor_status'] in CONFIG['ENS160']['STATUS'].values():
-                    display.text(f"{sensor_data['sensor_status']}", 0, 40, 1)
+            if page == 0:
+                # Main readings page
+                display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 0, 1)
+                display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 10, 1)
+                display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 20, 1)
+                
+                if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
+                    display.text("Status:", 0, 30, 1)
+                    if sensor_data['sensor_status'] in CONFIG['ENS160']['STATUS'].values():
+                        display.text(f"{sensor_data['sensor_status']}", 0, 40, 1)
+                    else:
+                        display.text("Unknown", 0, 40, 1)
                 else:
-                    display.text("Unknown", 0, 40, 1)
-            else:
-                display.text("Air Quality:", 0, 30, 1)
-                display.text(f"{sensor_data['aqi_rating']}", 0, 40, 1)
+                    display.text("Air Quality:", 0, 30, 1)
+                    display.text(f"{sensor_data['aqi_rating']}", 0, 40, 1)
 
-        elif page == 1:
-            # Air quality details
-            display.text("Air Quality Data", 0, 0, 1)
-            if sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
-                display.text(f"AQI: {sensor_data['aqi']}/5", 0, 15, 1)
-                display.text(f"TVOC:{sensor_data['tvoc']}ppb", 0, 25, 1)
-                eco2_val = sensor_data['eco2']
-                if eco2_val > 9999:  # Handle large numbers
-                    display.text(f"CO2:{eco2_val//1000}k", 0, 35, 1)
+            elif page == 1:
+                # Air quality details
+                display.text("Air Quality Data", 0, 0, 1)
+                if sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
+                    display.text(f"AQI: {sensor_data['aqi']}/5", 0, 15, 1)
+                    display.text(f"TVOC:{sensor_data['tvoc']}ppb", 0, 25, 1)
+                    eco2_val = sensor_data['eco2']
+                    if eco2_val > 9999:
+                        display.text(f"CO2:{eco2_val//1000}k", 0, 35, 1)
+                    else:
+                        display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
                 else:
-                    display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
-            else:
-                display.text("Sensor not ready", 0, 25, 1)
-                display.text(f"{sensor_data['sensor_status']}", 0, 35, 1)
+                    display.text("Sensor not ready", 0, 25, 1)
+                    display.text(f"{sensor_data['sensor_status']}", 0, 35, 1)
 
-        elif page == 2:
-            # Temperature history
-            display.text("Temp History", 0, 0, 1)
-            temp_values = [r['tempC'] for r in self.reading_history]
-            if temp_values:
-                graph = self.create_simple_graph(temp_values, height=40)
-                for i, val in enumerate(graph):
-                    display.pixel(i, 63-val, 1)
-                display.text(f"L:{min(temp_values):.1f}", 0, 55, 1)
-                display.text(f"H:{max(temp_values):.1f}", 64, 55, 1)
+            elif page == 2:
+                # Temperature history graph
+                display.text("Temp History", 0, 0, 1)
+                
+                # Draw axes
+                display.hline(0, 63, 128, 1)  # x-axis
+                display.vline(0, 15, 48, 1)   # y-axis
+                
+                # Plot temperature points if we have history
+                if self.reading_history:
+                    temp_values = [r['tempC'] for r in self.reading_history]
+                    
+                    # Calculate scale for better visualization
+                    min_temp = min(temp_values)
+                    max_temp = max(temp_values)
+                    temp_range = max_temp - min_temp
+                    if temp_range == 0:
+                        temp_range = 1  # Prevent division by zero
+                    
+                    # Plot each point
+                    for i, temp in enumerate(temp_values):
+                        if i >= 128:  # Stay within display width
+                            break
+                        # Scale temperature to fit in our 48-pixel height
+                        y_pos = 63 - int(((temp - min_temp) / temp_range) * 40)
+                        display.pixel(i, y_pos, 1)
+                    
+                    # Show min/max values
+                    display.text(f"L:{min_temp:.1f}", 0, 55, 1)
+                    display.text(f"H:{max_temp:.1f}", 64, 55, 1)
+                else:
+                    display.text("No data", 0, 32, 1)
 
-        elif page == 3:
-            # Sensor health status
-            display.text("Sensor Health", 0, 0, 1)
-            health_status = self.get_sensor_health_status()
-            y = 12
-            for status in health_status:
-                icon = "✓" if status['healthy'] and status['fresh'] else "✗"
-                name = status['name'][:12]  # Truncate long names
-                display.text(f"{icon} {name}", 0, y, 1)
-                if status['errors'] > 0:
-                    display.text(f"Err:{status['errors']}", 70, y, 1)
-                y += 10
+            elif page == 3:
+                # Sensor health status
+                display.text("Sensor Health", 0, 0, 1)
+                health_status = self.get_sensor_health_status()
+                y = 12
+                for status in health_status:
+                    icon = "✓" if status['healthy'] and status['fresh'] else "✗"
+                    name = status['name'][:12]  # Truncate long names
+                    display.text(f"{icon} {name}", 0, y, 1)
+                    if status['errors'] > 0:
+                        display.text(f"Err:{status['errors']}", 70, y, 1)
+                    y += 10
 
-        elif page == 4:
-            # Environment recommendations
-            env_score, recommendations = self.environment_analyzer.get_environment_score(sensor_data)
-            display.text("Air Quality", 0, 0, 1)
-            display.text(f"Level: {env_score}", 0, 12, 1)
+            elif page == 4:
+                # Environment recommendations
+                env_score, recommendations = self.environment_analyzer.get_environment_score(sensor_data)
+                display.text("Air Quality", 0, 0, 1)
+                display.text(f"Level: {env_score}", 0, 12, 1)
+                
+                if recommendations:
+                    y = 25
+                    for i, rec in enumerate(recommendations[:2]):
+                        words = rec.split()
+                        line = ""
+                        line2 = ""
+                        for word in words:
+                            if len(line + word) < 16:
+                                line += word + " "
+                            else:
+                                line2 += word + " "
+                        display.text(line.strip(), 0, y, 1)
+                        if line2:
+                            y += 10
+                            display.text(line2.strip(), 0, y, 1)
+                        y += 12
+
+            display.show()
             
-            if recommendations:
-                y = 25
-                for i, rec in enumerate(recommendations[:2]):
-                    words = rec.split()
-                    line = ""
-                    line2 = ""
-                    for word in words:
-                        if len(line + word) < 16:
-                            line += word + " "
-                        else:
-                            line2 += word + " "
-                    display.text(line.strip(), 0, y, 1)
-                    if line2:
-                        y += 10
-                        display.text(line2.strip(), 0, y, 1)
-                    y += 12
-
-        display.show()
+        except Exception as e:
+            logger.error(f"Display update error on page {page}: {e}")
+            # Simple error recovery - just clear the display
+            try:
+                display.fill(0)
+                display.show()
+            except:
+                pass
 
     def run(self):
-        page = 0
+        page_update_time = time.time()
         while self.running:
             try:
+                current_time = time.time()
                 sensor_data = self.read_sensors()
                 self.update_console(sensor_data)
-                self.update_display(self.display, sensor_data, page)
-                self.write_to_influx(sensor_data)
                 
-                page = (page + 1) % CONFIG['DISPLAY_PAGES']
+                # Update display with error handling
+                try:
+                    self.update_display(self.display, sensor_data, self.current_page)
+                    # Change page every 3 seconds
+                    if current_time - page_update_time >= 3:
+                        self.current_page = (self.current_page + 1) % CONFIG['DISPLAY_PAGES']
+                        page_update_time = current_time
+                except Exception as e:
+                    logger.error(f"Display error: {e}")
+                    self.current_page = 0  # Reset to main page on error
+                
+                self.write_to_influx(sensor_data)
                 sleep_ms(CONFIG['MEASUREMENT_INTERVAL_MS'])
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
