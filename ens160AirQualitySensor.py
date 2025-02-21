@@ -238,9 +238,6 @@ class SensorManager:
         self.reading_history = deque(maxlen=128)  # Match display width for graphing
         self.environment_analyzer = EnvironmentAnalyzer()
         self.current_page = 0
-        self.temp_graph = None
-        self.graph_min_temp = 15  # Default minimum temperature for scaling
-        self.graph_max_temp = 30  # Default maximum temperature for scaling
 
     def init_influxdb(self):
         token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
@@ -262,9 +259,6 @@ class SensorManager:
             self.air_quality_sensor = PiicoDev_ENS160()
             self.atmospheric_sensor = PiicoDev_BME280()
             self.display = create_PiicoDev_SSD1306()
-            
-            # Create graph with no initial bounds - let it auto-scale
-            self.temp_graph = self.display.graph2D()
             
             # Show initialization message
             self.display.fill(0)
@@ -470,12 +464,7 @@ class SensorManager:
             "timestamp": time.time()
         }
 
-        # Update graph with each new reading regardless of sensor status
-        # This provides better visual feedback of sensor state
-        if self.temp_graph is not None:
-            self.display.updateGraph2D(self.temp_graph, int(tempC_tempSensor * 10))
-
-        # Only store reading history if sensor is operating correctly
+        # Store reading history if sensor is operating correctly
         if sensor_status == CONFIG['ENS160']['STATUS']['OK']:
             self.reading_history.append(reading)
             self.health.last_readings['atmospheric'] = (tempC, presPa, humRH)
@@ -581,19 +570,51 @@ class SensorManager:
                 # Temperature history graph
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 
-                # Show current temperature
+                # Show current temperature with better spacing
                 temp = sensor_data['tempC']
-                display.text(f"Now:{temp:.1f}C", 32, 0, 1)
+                display.text(f"{temp:.1f}C", 90, 0, 1)  # Moved to far right
                 
-                # Draw axes
-                display.hline(0, 63, 128, 1)  # x-axis at bottom
-                display.vline(0, 15, 48, 1)   # y-axis on left
+                # Draw graph area with better spacing
+                graph_top = 15     # Start below the title
+                graph_height = 35  # Leave space for min/max at bottom
                 
-                # Show min/max if we have history
+                # Draw axes with proper spacing
+                display.hline(10, graph_top + graph_height, 108, 1)  # x-axis
+                display.vline(10, graph_top, graph_height, 1)        # y-axis
+                
+                # Plot temperature history if we have data
                 if self.reading_history:
                     temp_values = [r['tempC'] for r in self.reading_history]
-                    display.text(f"L:{min(temp_values):.1f}", 0, 55, 1)
-                    display.text(f"H:{max(temp_values):.1f}", 64, 55, 1)
+                    min_temp = min(temp_values)
+                    max_temp = max(temp_values)
+                    temp_range = max_temp - min_temp
+                    
+                    # Ensure minimum range of 5 degrees for better visualization
+                    if temp_range < 5:
+                        mid = (max_temp + min_temp) / 2
+                        min_temp = mid - 2.5
+                        max_temp = mid + 2.5
+                        temp_range = 5
+                    
+                    # Plot the line graph
+                    last_x = None
+                    last_y = None
+                    
+                    for i, reading in enumerate(self.reading_history):
+                        temp = reading['tempC']
+                        # Scale x from 0-108 (graph width)
+                        x = 10 + int((i * 108) / len(self.reading_history))
+                        # Scale y from 0-35 (graph height), invert because display coordinates
+                        y = graph_top + graph_height - int(((temp - min_temp) * graph_height) / temp_range)
+                        
+                        if last_x is not None:
+                            display.line(last_x, last_y, x, y, 1)
+                        last_x = x
+                        last_y = y
+                    
+                    # Show min/max with better spacing
+                    display.text(f"L:{min_temp:.1f}", 0, 55, 1)
+                    display.text(f"H:{max_temp:.1f}", 64, 55, 1)
 
             elif page == 3:
                 # Only show health status page if there are issues
