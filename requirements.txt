@@ -1,0 +1,2 @@
+influxdb-client>=1.24.0
+piicodev>=1.4.0

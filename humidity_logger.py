@@ -13,8 +13,6 @@ org = "raider"
 url = "http://192.168.1.10:8086"
 bucket = "sensorData"
 
-print("Token: ", token)  # Remove this line after verification
-
 # Initialize InfluxDB Client
 write_client = InfluxDBClient(url=url, token=token, org=org)
 write_api = write_client.write_api(write_options=SYNCHRONOUS)
