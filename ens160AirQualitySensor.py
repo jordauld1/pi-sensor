@@ -1,39 +1,37 @@
-import math
 import logging
 import os
 import signal
 import sys
+import textwrap
 import time
 from typing import Dict, Any, Tuple, List
 from collections import deque
-from datetime import datetime
-from statistics import mean, median
 
-from PiicoDev_SSD1306 import *
+import PiicoDev_SSD1306 as ssd1306_driver
+from PiicoDev_SSD1306 import create_PiicoDev_SSD1306, WIDTH, HEIGHT
 from PiicoDev_ENS160 import PiicoDev_ENS160
 from PiicoDev_BME280 import PiicoDev_BME280
 from PiicoDev_TMP117 import PiicoDev_TMP117
 from PiicoDev_Unified import sleep_ms
 
-import influxdb_client
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # Configuration
 CONFIG = {
     'MEASUREMENT_INTERVAL_MS': 1000,  # How often to take measurements
-    'DISPLAY_PAGES': 6,              # Increased number of display pages
     'INFLUXDB': {
         'URL': "http://192.168.1.10:8086",
         'ORG': "raider",
         'BUCKET': "sensorData",
         'TOKEN_ENV_VAR': "INFLUXDB_TOKEN",
         'BATCH_SIZE': 60,            # Number of readings to batch before sending
-        'SEND_INTERVAL_SEC': 60,     # Send data every minute
+        'SEND_INTERVAL_SEC': 60,     # Send (or retry) at most once per interval
+        'TIMEOUT_MS': 5000,          # HTTP timeout; a write blocks the main loop
     },
     'SENSOR_LOCATION': "bedroom3",   # Location tag for InfluxDB
     'CACHE': {
-        'MAX_SIZE': 1000,           # Maximum number of readings to cache in RAM
+        'MAX_SIZE': 3600,           # Readings kept in RAM while InfluxDB is unreachable (~1 hour)
     },
     'HEALTH_CHECK': {
         'TEMP_RANGE': (-10, 50),     # Valid temperature range in Celsius
@@ -65,26 +63,6 @@ CONFIG = {
             'ECO2': 400
         }
     },
-    'ENVIRONMENT_RATINGS': {
-        'CO2': {
-            'EXCELLENT': (400, 800),
-            'GOOD': (800, 1000),
-            'FAIR': (1000, 1500),
-            'POOR': (1500, 2000),
-            'DANGEROUS': (2000, 65000)
-        },
-        'HUMIDITY': {
-            'TOO_DRY': (0, 30),
-            'GOOD': (30, 60),
-            'TOO_HUMID': (60, 100)
-        },
-        'RECOMMENDATIONS': {
-            'HIGH_CO2': 'Open windows for fresh air',
-            'HIGH_HUMIDITY': 'Increase ventilation',
-            'LOW_HUMIDITY': 'Consider humidifier',
-            'POOR_AQI': 'Air purification recommended'
-        }
-    },
     'DISPLAY': {
         'PAGES': 5,           # Total number of pages (0-4)
         'PAGE_TITLES': [
@@ -94,16 +72,67 @@ CONFIG = {
             'Sensor Health',   # Page 3
             'Environment'      # Page 4
         ],
-        'UPDATE_INTERVAL_SEC': 3  # Seconds between page changes
+        'UPDATE_INTERVAL_SEC': 3,  # Seconds between page changes
+        'GRAPH_SAMPLE_INTERVAL_SEC': 60,  # One graph point per minute -> ~2 hours across the screen
     },
 }
 
-# Configure logging
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font-pet-me-128.dat")
+CHARS_PER_LINE = WIDTH // 8
+
+# Configure logging (set LOG_LEVEL=DEBUG to print every reading)
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def patch_display_driver():
+    """Speed up the PiicoDev SSD1306 driver on Linux.
+
+    The stock driver sends three I2C commands for every pixel it sets and
+    re-reads the font file (relative to the current directory) on every text()
+    call, even though show() pushes the whole framebuffer anyway. Draw into the
+    buffer only and load the font once, from next to this script.
+    """
+    if getattr(ssd1306_driver, '_SYSNAME', None) != 'Linux':
+        return
+
+    with open(FONT_PATH, 'rb') as f:
+        font = f.read()
+
+    def pixel(self, x, y, color):
+        x = x & (WIDTH - 1)
+        y = y & (HEIGHT - 1)
+        page, shift_page = divmod(y, 8)
+        ind = x + page * WIDTH
+        if color:
+            self.buffer[ind] |= 1 << shift_page
+        else:
+            self.buffer[ind] &= ~(1 << shift_page)
+
+    def fill(self, c=0):
+        self.buffer[:] = (b'\xff' if c > 0 else b'\x00') * len(self.buffer)
+
+    def text(self, text, x, y, c=1):
+        for text_index, char in enumerate(text):
+            base = (ord(char) - 32) * 8
+            if base < 0 or base + 8 > len(font):
+                continue  # Character not in the font
+            for col in range(8):
+                x_coordinate = x + col + text_index * 8
+                if x_coordinate >= WIDTH:
+                    break
+                bits = font[base + col]
+                for i in range(7):
+                    if bits & (1 << i) and y + i < HEIGHT:
+                        pixel(self, x_coordinate, y + i, c)
+
+    ssd1306_driver.PiicoDev_SSD1306.pixel = pixel
+    ssd1306_driver.PiicoDev_SSD1306.fill = fill
+    ssd1306_driver.PiicoDev_SSD1306.text = text
+
 
 class SensorHealth:
     def __init__(self):
@@ -166,7 +195,7 @@ class EnvironmentAnalyzer:
         # Use the actual AQI rating from ENS160 as our base score
         base_score = sensor_data['aqi_rating']
         recommendations = []
-        
+
         # Check CO2 levels using more granular thresholds
         eco2 = sensor_data['eco2']
         if eco2 > 2000:
@@ -175,7 +204,7 @@ class EnvironmentAnalyzer:
             recommendations.append('Open windows')
         elif eco2 > 800:
             recommendations.append('Consider fresh air')
-            
+
         # Check TVOC levels with more granular thresholds
         tvoc = sensor_data['tvoc']
         if tvoc > 10000:
@@ -184,7 +213,7 @@ class EnvironmentAnalyzer:
             recommendations.append('Ventilate space')
         elif tvoc > 500:
             recommendations.append('Check VOC sources')
-            
+
         # More sensitive humidity recommendations
         humidity = sensor_data['humRH']
         if humidity < 30:
@@ -195,27 +224,28 @@ class EnvironmentAnalyzer:
             recommendations.append('Very humid: dehumidify')
         elif humidity > 60:
             recommendations.append('Getting humid')
-            
+
         # Temperature comfort recommendations
         temp = sensor_data['tempC']
         if temp > 26:
             recommendations.append('Space too warm')
         elif temp < 17:
             recommendations.append('Space too cool')
-            
+
         # Add AQI-based recommendations
         if sensor_data['aqi'] >= 4:
             recommendations.append('Poor air: purify!')
-            
-        return base_score, list(set(recommendations))[:2]  # Return up to 2 unique recommendations
+
+        # Checks above are in priority order and never repeat, so keep the order
+        return base_score, recommendations[:2]
 
     @staticmethod
     def get_comfort_status(sensor_data: Dict[str, Any]) -> str:
         """Get overall comfort status when no immediate actions needed"""
-        if (18 <= sensor_data['tempC'] <= 25 and 
-            30 <= sensor_data['humRH'] <= 60 and 
-            sensor_data['eco2'] < 800 and 
-            sensor_data['tvoc'] < 500 and 
+        if (18 <= sensor_data['tempC'] <= 25 and
+            30 <= sensor_data['humRH'] <= 60 and
+            sensor_data['eco2'] < 800 and
+            sensor_data['tvoc'] < 500 and
             sensor_data['aqi'] <= 2):
             return "All parameters OK"
         return "Monitor values"
@@ -232,9 +262,9 @@ class SensorManager:
         self.data_cache = deque(maxlen=CONFIG['CACHE']['MAX_SIZE'])
         self.last_influx_send = 0
         self.health = SensorHealth()
-        self.error_history = []
-        self.reading_history = deque(maxlen=128)  # Match display width for graphing
-        self.temp_graph = None  # Will be initialized when display is ready
+        self.temp_history = deque(maxlen=WIDTH)  # One point per pixel column
+        self.last_graph_sample = 0
+        self.last_ens160_status = None
         self.environment_analyzer = EnvironmentAnalyzer()
         self.current_page = 0
 
@@ -242,11 +272,12 @@ class SensorManager:
         token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
         if not token:
             raise ValueError(f"Missing {CONFIG['INFLUXDB']['TOKEN_ENV_VAR']} environment variable")
-        
+
         self.influx_client = InfluxDBClient(
             url=CONFIG['INFLUXDB']['URL'],
             token=token,
-            org=CONFIG['INFLUXDB']['ORG']
+            org=CONFIG['INFLUXDB']['ORG'],
+            timeout=CONFIG['INFLUXDB']['TIMEOUT_MS']
         )
         self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
         logger.info("InfluxDB client initialized successfully")
@@ -258,20 +289,14 @@ class SensorManager:
             self.air_quality_sensor = PiicoDev_ENS160()
             self.atmospheric_sensor = PiicoDev_BME280()
             self.display = create_PiicoDev_SSD1306()
-            # Initialize the temperature graph with appropriate min/max values
-            self.temp_graph = self.display.graph2D(
-                minValue=15,  # Typical indoor minimum temperature
-                maxValue=30,  # Typical indoor maximum temperature
-                height=35     # Leave space for labels
-            )
-            
+
             # Show initialization message
             self.display.fill(0)
             self.display.text("Initializing", 0, 0, 1)
             self.display.text("sensors...", 0, 10, 1)
             self.display.show()
             sleep_ms(1000)
-            
+
             logger.info("All sensors initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize devices: {e}")
@@ -305,53 +330,55 @@ class SensorManager:
     def validate_data_point(self, data: Dict[str, Any]) -> bool:
         """Validate sensor data against documented ranges before sending to InfluxDB"""
         try:
-            # First check operational status
+            # ENS160 warm-up is expected and logged on status change, so skip quietly
             if data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
-                logger.warning(f"ENS160 not ready: {data['sensor_status']}")
                 return False
-                
-            # Temperature validation
-            if not CONFIG['HEALTH_CHECK']['TEMP_RANGE'][0] <= data['tempC'] <= CONFIG['HEALTH_CHECK']['TEMP_RANGE'][1]:
+
+            # Atmospheric values are substituted from the last good reading on
+            # failure; those are fine for the display but must not be stored
+            if not data['atmospheric_ok']:
                 return False
-                
-            # ENS160 validations based on documentation
-            if not (CONFIG['ENS160']['TVOC_RANGE'][0] <= data['tvoc'] <= CONFIG['ENS160']['TVOC_RANGE'][1]):
-                return False
-                
-            if not (CONFIG['ENS160']['ECO2_RANGE'][0] <= data['eco2'] <= CONFIG['ENS160']['ECO2_RANGE'][1]):
-                return False
-                
-            # AQI must be 1-5 per ENS160 docs
-            if not (1 <= data['aqi'] <= len(CONFIG['ENS160']['AQI_RATINGS'])):
-                return False
-                
-            # Basic range checks for atmospheric data
-            if not (0 <= data['humRH'] <= 100):
-                return False
-                
-            if not (CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][0] <= data['pres_hPa'] <= CONFIG['HEALTH_CHECK']['PRESSURE_RANGE'][1]):
-                return False
-                
+
+            checks = [
+                ('temperature', data['tempC'], CONFIG['HEALTH_CHECK']['TEMP_RANGE']),
+                ('humidity', data['humRH'], CONFIG['HEALTH_CHECK']['HUMID_RANGE']),
+                ('pressure', data['pres_hPa'], CONFIG['HEALTH_CHECK']['PRESSURE_RANGE']),
+                # ENS160 validations based on documentation
+                ('tvoc', data['tvoc'], CONFIG['ENS160']['TVOC_RANGE']),
+                ('eco2', data['eco2'], CONFIG['ENS160']['ECO2_RANGE']),
+                # AQI must be 1-5 per ENS160 docs
+                ('aqi', data['aqi'], (1, len(CONFIG['ENS160']['AQI_RATINGS']))),
+            ]
+            for name, value, (low, high) in checks:
+                if not low <= value <= high:
+                    logger.warning(f"Skipping InfluxDB storage: {name}={value} outside {low}-{high}")
+                    return False
+
             return True
-        except (KeyError, TypeError):
+        except (KeyError, TypeError) as e:
+            logger.warning(f"Skipping InfluxDB storage: malformed reading ({e})")
             return False
 
     def write_to_influx(self, sensor_data: Dict[str, Any]):
         """Add data to cache and potentially send to InfluxDB"""
-        if self.validate_data_point(sensor_data):
-            self.data_cache.append(sensor_data)
-            
-            current_time = time.time()
-            if (current_time - self.last_influx_send >= CONFIG['INFLUXDB']['SEND_INTERVAL_SEC'] and 
-                len(self.data_cache) >= CONFIG['INFLUXDB']['BATCH_SIZE']):
-                self.flush_cache()
-        else:
-            logger.warning("Invalid sensor data point detected, skipping InfluxDB storage")
+        if not self.validate_data_point(sensor_data):
+            return
+
+        self.data_cache.append(sensor_data)
+
+        current_time = time.time()
+        if (current_time - self.last_influx_send >= CONFIG['INFLUXDB']['SEND_INTERVAL_SEC'] and
+            len(self.data_cache) >= CONFIG['INFLUXDB']['BATCH_SIZE']):
+            self.flush_cache()
 
     def flush_cache(self):
         """Attempt to send all cached data to InfluxDB"""
         if not self.data_cache:
             return
+
+        # Count failed attempts too, so an unreachable server is retried once per
+        # interval instead of on every reading (each attempt blocks for the timeout)
+        self.last_influx_send = time.time()
 
         try:
             points = []
@@ -369,6 +396,9 @@ class SensorManager:
                     .field("aqi_rating", data['aqi_rating'])
                     .field("eco2_rating", data['eco2_rating'])
                     .field("sensor_status", data['sensor_status'])
+                    # Without an explicit time every point in the batch gets the
+                    # server's receive time and they overwrite each other
+                    .time(data['timestamp_ms'], WritePrecision.MS)
                 )
                 points.append(point)
 
@@ -377,19 +407,25 @@ class SensorManager:
                 org=CONFIG['INFLUXDB']['ORG'],
                 record=points
             )
-            
+
             self.data_cache.clear()
-            self.last_influx_send = time.time()
             logger.info(f"Successfully sent {len(points)} readings to InfluxDB")
         except Exception as e:
-            logger.error(f"Error writing to InfluxDB: {e}")
-            # Data remains in cache for next attempt
+            logger.error(f"Error writing to InfluxDB ({len(self.data_cache)} readings kept for retry): {e}")
+
+    def log_ens160_status(self, sensor_status: str):
+        if sensor_status != self.last_ens160_status:
+            logger.info(f"ENS160 status: {sensor_status}")
+            self.last_ens160_status = sensor_status
 
     def read_sensors(self) -> Dict[str, Any]:
+        atmospheric_ok = False
         try:
             tempC, presPa, humRH = self.atmospheric_sensor.values()
             self.health.update_sensor_time('atmospheric')
-            
+            atmospheric_ok = True
+            self.health.last_readings['atmospheric'] = (tempC, presPa, humRH)
+
             if not all(self.health.validate_reading(t, v) for t, v in [
                 ('temperature', tempC),
                 ('humidity', humRH),
@@ -401,12 +437,15 @@ class SensorManager:
         except Exception as e:
             self.health.increment_error('atmospheric')
             logger.error(f"Atmospheric sensor error: {e}")
-            tempC, presPa, humRH = self.health.last_readings.get('atmospheric', (20, 101325, 50))
+            tempC, presPa, humRH = self.health.last_readings['atmospheric'] or (20, 101325, 50)
 
+        temp_sensor_ok = False
         try:
             tempC_tempSensor = self.temp_sensor.readTempC()
             self.health.update_sensor_time('temp_sensor')
-            
+            temp_sensor_ok = True
+            self.health.last_readings['temp_sensor'] = tempC_tempSensor
+
             if not self.health.validate_reading('temperature', tempC_tempSensor):
                 self.health.increment_error('temp_sensor')
             else:
@@ -417,10 +456,10 @@ class SensorManager:
             tempC_tempSensor = tempC
 
         # Initialize air quality variables with defaults
-        aqi = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['AQI'], 
+        aqi = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['AQI'],
                               'rating': CONFIG['ENS160']['AQI_RATINGS'][CONFIG['ENS160']['DEFAULT_VALUES']['AQI']]})()
         tvoc = CONFIG['ENS160']['DEFAULT_VALUES']['TVOC']
-        eco2 = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['ECO2'], 
+        eco2 = type('obj', (), {'value': CONFIG['ENS160']['DEFAULT_VALUES']['ECO2'],
                                'rating': 'Normal'})()
         sensor_status = CONFIG['ENS160']['STATUS']['ERROR']
 
@@ -428,35 +467,37 @@ class SensorManager:
             # Update ENS160 with current temperature and humidity for compensation
             self.air_quality_sensor.temperature = tempC_tempSensor
             self.air_quality_sensor.humidity = humRH
-            
-            # Check operational status
+
+            # Check operational status. Warm-up after power-on is normal, not a fault.
             sensor_status = self.air_quality_sensor.operation
-            if sensor_status != CONFIG['ENS160']['STATUS']['OK']:
-                logger.info(f"ENS160 not ready: {sensor_status}")
-                raise ValueError(f"ENS160 not operating correctly: {sensor_status}")
-            
-            aqi = self.air_quality_sensor.aqi
-            tvoc = self.air_quality_sensor.tvoc
-            eco2 = self.air_quality_sensor.eco2
-            
-            # Validate readings against documented ranges
-            if not all(self.health.validate_sensor_reading(t, v) for t, v in [
-                ('tvoc', tvoc),
-                ('eco2', eco2.value),
-                ('aqi', aqi.value)
-            ]):
-                self.health.increment_error('air_quality')
-            else:
-                self.health.reset_error('air_quality')
-                
+            self.log_ens160_status(sensor_status)
             self.health.update_sensor_time('air_quality')
+
+            if sensor_status == CONFIG['ENS160']['STATUS']['OK']:
+                aqi = self.air_quality_sensor.aqi
+                tvoc = self.air_quality_sensor.tvoc
+                eco2 = self.air_quality_sensor.eco2
+
+                # Validate readings against documented ranges
+                if not all(self.health.validate_sensor_reading(t, v) for t, v in [
+                    ('tvoc', tvoc),
+                    ('eco2', eco2.value),
+                    ('aqi', aqi.value)
+                ]):
+                    self.health.increment_error('air_quality')
+                else:
+                    self.health.reset_error('air_quality')
+
+                self.health.last_readings['air_quality'] = (aqi, tvoc, eco2)
         except Exception as e:
+            # Don't let a status read before the failure mark this reading as good
+            sensor_status = CONFIG['ENS160']['STATUS']['ERROR']
             self.health.increment_error('air_quality')
             logger.error(f"Air quality sensor error: {e}")
-            if self.health.last_readings.get('air_quality'):
+            if self.health.last_readings['air_quality']:
                 aqi, tvoc, eco2 = self.health.last_readings['air_quality']
 
-        reading = {
+        return {
             "tempC": tempC_tempSensor,
             "pres_hPa": presPa / 100,
             "humRH": humRH,
@@ -466,27 +507,42 @@ class SensorManager:
             "eco2": eco2.value,
             "eco2_rating": eco2.rating,
             "sensor_status": sensor_status,
-            "timestamp": time.time()
+            "atmospheric_ok": atmospheric_ok,
+            "temp_ok": temp_sensor_ok or atmospheric_ok,
+            "timestamp_ms": time.time_ns() // 1_000_000
         }
 
-        # Store reading history if sensor is operating correctly
-        if sensor_status == CONFIG['ENS160']['STATUS']['OK']:
-            self.reading_history.append(reading)
-            self.health.last_readings['atmospheric'] = (tempC, presPa, humRH)
-            self.health.last_readings['temp_sensor'] = tempC_tempSensor
-            self.health.last_readings['air_quality'] = (aqi, tvoc, eco2)
+    def sample_temp_history(self, sensor_data: Dict[str, Any], current_time: float):
+        """Record temperature for the graph on every page, not just while it is shown"""
+        if not sensor_data['temp_ok']:
+            return
+        if current_time - self.last_graph_sample >= CONFIG['DISPLAY']['GRAPH_SAMPLE_INTERVAL_SEC']:
+            self.temp_history.append(sensor_data['tempC'])
+            self.last_graph_sample = current_time
 
-        return reading
+    def draw_temp_graph(self, display, top: int, bottom: int):
+        """Plot sampled temperature history, newest on the right, auto-scaled"""
+        values = list(self.temp_history)
+        if not values:
+            return
 
-    def update_graph(self, temperature: float):
-        """Update temperature graph"""
-        try:
-            # Scale temperature by 10 to get better resolution
-            temp_val = int(temperature * 10)
-            if self.temp_graph is not None:
-                self.display.updateGraph2D(self.temp_graph, temp_val)
-        except Exception as e:
-            logger.error(f"Error updating temperature graph: {e}")
+        low, high = min(values), max(values)
+        # Keep at least 1C of span so sensor noise doesn't fill the whole height
+        if high - low < 1.0:
+            mid = (high + low) / 2
+            low, high = mid - 0.5, mid + 0.5
+        scale = (bottom - top) / (high - low)
+
+        x = WIDTH - len(values)
+        prev_y = None
+        for value in values:
+            y = bottom - round((value - low) * scale)
+            if prev_y is None:
+                display.pixel(x, y, 1)
+            else:
+                display.line(x - 1, prev_y, x, y, 1)
+            prev_y = y
+            x += 1
 
     def get_sensor_health_status(self):
         status = []
@@ -502,14 +558,13 @@ class SensorManager:
         return status
 
     def update_console(self, sensor_data):
-        print(
-            f"Temp: {sensor_data['tempC']} °C, Press: {sensor_data['pres_hPa']} hPa, Humid: {sensor_data['humRH']} %RH"
+        # Debug level: at one reading per second this would otherwise flood the journal
+        logger.debug(
+            f"Temp: {sensor_data['tempC']:.2f} °C, Press: {sensor_data['pres_hPa']:.1f} hPa, "
+            f"Humid: {sensor_data['humRH']:.1f} %RH, AQI: {sensor_data['aqi']}, "
+            f"TVOC: {sensor_data['tvoc']} ppb, eCO2: {sensor_data['eco2']} ppm, "
+            f"Status: {sensor_data['sensor_status']}"
         )
-        print(
-            f"AQI: {sensor_data['aqi']}, TVOC: {sensor_data['tvoc']} ppb, eCO2: {sensor_data['eco2']} ppm"
-        )
-        print(f"Sensor Status: {sensor_data['sensor_status']}")
-        print("--------------------------------")
 
     def reset_display(self):
         """Reset display and graph if errors occur"""
@@ -524,21 +579,21 @@ class SensorManager:
     def update_display(self, display, sensor_data, page=0):
         try:
             display.fill(0)
-            
+
             if page == 0:
                 # Main readings page (no changes)
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 display.text(f"Temp: {sensor_data['tempC']:.1f}C", 0, 12, 1)
                 display.text(f"Humid: {sensor_data['humRH']:.1f}%", 0, 22, 1)
                 display.text(f"Press: {sensor_data['pres_hPa']:.1f}", 0, 32, 1)
-                
+
                 if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
                     display.text("Status:", 0, 42, 1)
-                    status_text = sensor_data['sensor_status'][:16]
+                    status_text = sensor_data['sensor_status'][:CHARS_PER_LINE]
                     display.text(status_text, 0, 52, 1)
                 else:
                     display.text("Air Quality:", 0, 42, 1)
-                    rating_text = sensor_data['aqi_rating'][:16]
+                    rating_text = sensor_data['aqi_rating'][:CHARS_PER_LINE]
                     display.text(rating_text, 0, 52, 1)
 
             elif page == 1:
@@ -554,31 +609,26 @@ class SensorManager:
                         display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
                 else:
                     display.text("Sensor not ready", 0, 25, 1)
-                    status_text = sensor_data['sensor_status'][:16]
+                    status_text = sensor_data['sensor_status'][:CHARS_PER_LINE]
                     display.text(status_text, 0, 35, 1)
 
             elif page == 2:
                 # Temperature history graph
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
-                temp = sensor_data['tempC']
-                display.text(f"{temp:.1f}C", 90, 0, 1)
-                
-                # Update and draw the temperature graph
-                if self.temp_graph is not None:
-                    display.updateGraph2D(self.temp_graph, temp)
-                    
-                # Show min/max from reading history
-                if self.reading_history:
-                    temp_values = [r['tempC'] for r in self.reading_history]
-                    min_temp = min(temp_values)
-                    max_temp = max(temp_values)
-                    display.text(f"L:{min_temp:.1f}", 0, 55, 1)
-                    display.text(f"H:{max_temp:.1f}", 64, 55, 1)
+                temp_text = f"{sensor_data['tempC']:.1f}C"
+                display.text(temp_text, WIDTH - len(temp_text) * 8, 0, 1)
+
+                if self.temp_history:
+                    self.draw_temp_graph(display, top=12, bottom=52)
+                    display.text(f"L:{min(self.temp_history):.1f}", 0, 56, 1)
+                    display.text(f"H:{max(self.temp_history):.1f}", 64, 56, 1)
+                else:
+                    display.text("Collecting...", 0, 30, 1)
 
             elif page == 3:
                 # Only show health status page if there are issues
                 health_status = self.get_sensor_health_status()
-                all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0 
+                all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0
                                 for status in health_status)
                 if not all_healthy:
                     display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
@@ -596,53 +646,52 @@ class SensorManager:
                 # Environment recommendations with more detailed triggers
                 display.text(CONFIG['DISPLAY']['PAGE_TITLES'][page], 0, 0, 1)
                 env_score, recommendations = self.environment_analyzer.get_environment_score(sensor_data)
-                
-                score_text = f"Level: {env_score}"[:16]
-                display.text(score_text, 0, 15, 1)
-                
+
+                score_text = f"Level: {env_score}"[:CHARS_PER_LINE]
+                display.text(score_text, 0, 14, 1)
+
                 # Always show at least basic status even if no recommendations
                 if not recommendations:
-                    if sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
-                        if sensor_data['aqi'] == 1:
-                            display.text("Air quality ideal", 0, 27, 1)
-                        elif sensor_data['aqi'] == 2:
-                            display.text("Air quality good", 0, 27, 1)
-                            display.text("Continue ventilation", 0, 39, 1)
+                    if sensor_data['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
+                        messages = ["Sensor warm-up"]
+                    elif sensor_data['aqi'] == 1:
+                        messages = ["Excellent air"]
+                    elif sensor_data['aqi'] == 2:
+                        messages = ["Air quality good", "Keep ventilating"]
                     else:
-                        display.text("Sensor warming up", 0, 27, 1)
+                        messages = [self.environment_analyzer.get_comfort_status(sensor_data)]
                 else:
-                    y = 27
-                    for rec in recommendations[:2]:
-                        # Split long recommendations
-                        if len(rec) > 16:
-                            display.text(rec[:16], 0, y, 1)
-                            if len(rec) > 16:
-                                display.text(rec[16:32], 0, y + 10, 1)
-                                y += 20
-                        else:
-                            display.text(rec, 0, y, 1)
-                            y += 12
+                    messages = recommendations
+
+                y = 26
+                for message in messages:
+                    # Word-wrap to the 16 character display width
+                    for line in textwrap.wrap(message, CHARS_PER_LINE)[:2]:
+                        display.text(line, 0, y, 1)
+                        y += 9
+                    y += 2
 
             display.show()
-            
+
         except Exception as e:
             logger.error(f"Display update error on page {page}: {e}")
             try:
                 display.fill(0)
                 display.show()
-            except:
+            except Exception:
                 pass
 
     def run(self):
         page_update_time = time.time()
         startup_message_shown = False
-        
+
         while self.running:
             try:
                 current_time = time.time()
                 sensor_data = self.read_sensors()
                 self.update_console(sensor_data)
-                
+                self.sample_temp_history(sensor_data, current_time)
+
                 # Show startup message on first successful reading
                 if not startup_message_shown and sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
                     self.display.fill(0)
@@ -651,52 +700,61 @@ class SensorManager:
                     self.display.show()
                     sleep_ms(1000)
                     startup_message_shown = True
-                
+
                 # Update display with error handling
                 try:
                     health_status = self.get_sensor_health_status()
-                    all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0 
+                    all_healthy = all(status['healthy'] and status['fresh'] and status['errors'] == 0
                                     for status in health_status)
-                    
+
                     if current_time - page_update_time >= CONFIG['DISPLAY']['UPDATE_INTERVAL_SEC']:
                         next_page = (self.current_page + 1) % CONFIG['DISPLAY']['PAGES']
                         if all_healthy and next_page == 3:
                             next_page = 4  # Skip health page if all healthy
                         self.current_page = next_page
                         page_update_time = current_time
-                    
+
                     self.update_display(self.display, sensor_data, self.current_page)
-                    
+
                 except Exception as e:
                     logger.error(f"Display error: {e}")
                     self.current_page = 0
                     self.reset_display()
-                
+
                 self.write_to_influx(sensor_data)
-                sleep_ms(CONFIG['MEASUREMENT_INTERVAL_MS'])
+
+                # Sleep for the rest of the interval so readings stay evenly spaced
+                elapsed_ms = int((time.time() - current_time) * 1000)
+                sleep_ms(max(0, CONFIG['MEASUREMENT_INTERVAL_MS'] - elapsed_ms))
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
                 sleep_ms(5000)  # Wait before retrying
 
-def signal_handler(signum, frame):
-    logger.info(f"Received signal {signum}")
-    if sensor_manager:
-        sensor_manager.cleanup()
-    sys.exit(0)
+def main():
+    sensor_manager = SensorManager()
 
-if __name__ == "__main__":
+    def signal_handler(signum, frame):
+        # Only stop the loop here; cleanup runs once the current iteration
+        # finishes, rather than interrupting it mid-write
+        logger.info(f"Received signal {signum}, shutting down")
+        sensor_manager.running = False
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    sensor_manager = None
+
+    exit_code = 0
     try:
-        sensor_manager = SensorManager()
+        patch_display_driver()
         sensor_manager.init_influxdb()
         sensor_manager.init_devices()
         logger.info("Starting sensor monitoring...")
         sensor_manager.run()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        if sensor_manager:
-            sensor_manager.cleanup()
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        sensor_manager.cleanup()
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()

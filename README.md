@@ -104,15 +104,20 @@ Edit the `CONFIG` dictionary in `ens160AirQualitySensor.py`:
 
 ```python
 CONFIG = {
-    'MEASUREMENT_INTERVAL_MS': 1000,
+    'MEASUREMENT_INTERVAL_MS': 1000,     # One reading (and one InfluxDB point) per interval
     'INFLUXDB': {
         'URL': "http://your-influx-server:8086",
         'ORG': "your-org",
         'BUCKET': "sensorData",
+        'SEND_INTERVAL_SEC': 60,         # Batch upload / retry interval
     },
     'SENSOR_LOCATION': "room-name",
+    'CACHE': {'MAX_SIZE': 3600},         # Readings buffered while InfluxDB is unreachable
+    'DISPLAY': {'GRAPH_SAMPLE_INTERVAL_SEC': 60},  # Temp graph spans 128 samples
 }
 ```
+
+Set `LOG_LEVEL=DEBUG` to log every reading; the default `INFO` only logs status changes, errors, and one line per upload.
 
 ### Run
 
@@ -122,7 +127,11 @@ python3 ens160AirQualitySensor.py
 
 ### Run as a Service (optional)
 
+Keep the token out of the unit file (unit files are world-readable, and `systemctl show` prints their environment):
+
 ```bash
+echo 'INFLUXDB_TOKEN=your-token-here' | sudo tee /etc/pi-sensor.env
+sudo chmod 600 /etc/pi-sensor.env
 sudo nano /etc/systemd/system/air-quality.service
 ```
 
@@ -132,7 +141,7 @@ Description=Air Quality Monitoring
 After=network.target
 
 [Service]
-Environment=INFLUXDB_TOKEN=your-token-here
+EnvironmentFile=/etc/pi-sensor.env
 ExecStart=/usr/bin/python3 /path/to/ens160AirQualitySensor.py
 WorkingDirectory=/path/to/script/directory
 Restart=always
@@ -153,7 +162,10 @@ sudo systemctl start air-quality
 Measurement: sensorReading
 Tags:    sensor, location
 Fields:  temperature, humidity, pressure, aqi, tvoc, eco2, aqi_rating, eco2_rating, sensor_status
+Time:    when the reading was taken (ms precision), not when the batch was uploaded
 ```
+
+Only readings taken while the ENS160 reports `operating ok` and all sensors read successfully are stored.
 
 ## Troubleshooting
 
