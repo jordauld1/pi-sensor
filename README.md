@@ -82,7 +82,7 @@ The OLED cycles through five pages:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-pip python3-smbus i2c-tools
+sudo apt-get install -y python3-venv i2c-tools
 
 # Enable I2C
 sudo raspi-config  # Interface Options → I2C → Enable
@@ -93,10 +93,15 @@ sudo i2cdetect -y 1
 
 ### Setup
 
+Current Raspberry Pi OS / Debian blocks `pip install` into the system Python (PEP 668), so use a virtual environment inside the repo (`.venv/` is git-ignored):
+
 ```bash
-pip3 install -r requirements.txt
-export INFLUXDB_TOKEN="your-token-here"
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+export INFLUXDB_TOKEN="your-token-here"   # a write-only token for the bucket is enough
 ```
+
+After an OS upgrade that changes the Python version, recreate it: `rm -rf .venv` and repeat the two commands above.
 
 ### Configuration
 
@@ -123,7 +128,7 @@ Set `LOG_LEVEL=DEBUG` to log every reading; the default `INFO` only logs status 
 ### Run
 
 ```bash
-python3 ens160AirQualitySensor.py
+.venv/bin/python ens160AirQualitySensor.py
 ```
 
 ### Run as a Service (optional)
@@ -143,8 +148,8 @@ After=network.target
 
 [Service]
 EnvironmentFile=/etc/pi-sensor.env
-ExecStart=/usr/bin/python3 /path/to/ens160AirQualitySensor.py
-WorkingDirectory=/path/to/script/directory
+ExecStart=/path/to/pi-sensor/.venv/bin/python /path/to/pi-sensor/ens160AirQualitySensor.py
+WorkingDirectory=/path/to/pi-sensor
 Restart=always
 User=pi
 
@@ -181,7 +186,7 @@ Logs are written to stdout. Monitor with:
 
 ```bash
 journalctl -u air-quality -f          # if running as service
-python3 ens160AirQualitySensor.py 2>&1 | tee sensor.log  # if running directly
+.venv/bin/python ens160AirQualitySensor.py 2>&1 | tee sensor.log  # if running directly
 ```
 
 ## Documentation
