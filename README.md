@@ -104,15 +104,16 @@ Edit the `CONFIG` dictionary in `ens160AirQualitySensor.py`:
 
 ```python
 CONFIG = {
-    'MEASUREMENT_INTERVAL_MS': 1000,     # One reading (and one InfluxDB point) per interval
+    'MEASUREMENT_INTERVAL_MS': 1000,     # Sensor/display refresh rate
     'INFLUXDB': {
         'URL': "http://your-influx-server:8086",
         'ORG': "your-org",
         'BUCKET': "sensorData",
-        'SEND_INTERVAL_SEC': 60,         # Batch upload / retry interval
+        'POINT_INTERVAL_SEC': 60,        # Readings are averaged into one point per minute
+        'SEND_INTERVAL_SEC': 300,        # Queued points are uploaded in one request every 5 minutes
     },
     'SENSOR_LOCATION': "room-name",
-    'CACHE': {'MAX_SIZE': 3600},         # Readings buffered while InfluxDB is unreachable
+    'CACHE': {'MAX_SIZE': 1440},         # Points buffered while InfluxDB is unreachable (~24h)
     'DISPLAY': {'GRAPH_SAMPLE_INTERVAL_SEC': 60},  # Temp graph spans 128 samples
 }
 ```
@@ -162,10 +163,10 @@ sudo systemctl start air-quality
 Measurement: sensorReading
 Tags:    sensor, location
 Fields:  temperature, humidity, pressure, aqi, tvoc, eco2, aqi_rating, eco2_rating, sensor_status
-Time:    when the reading was taken (ms precision), not when the batch was uploaded
+Time:    end of each averaging window (one point per POINT_INTERVAL_SEC), not upload time
 ```
 
-Only readings taken while the ENS160 reports `operating ok` and all sensors read successfully are stored.
+Each point is the mean of the valid readings in its window (aqi, tvoc and eco2 rounded to integers). Only readings taken while the ENS160 reports `operating ok` and all sensors read successfully are included.
 
 ## Troubleshooting
 

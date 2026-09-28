@@ -6,6 +6,7 @@ import textwrap
 import time
 from typing import Dict, Any, Tuple, List
 from collections import deque
+from statistics import mean
 
 import PiicoDev_SSD1306 as ssd1306_driver
 from PiicoDev_SSD1306 import create_PiicoDev_SSD1306, WIDTH, HEIGHT
@@ -25,13 +26,13 @@ CONFIG = {
         'ORG': "raider",
         'BUCKET': "sensorData",
         'TOKEN_ENV_VAR': "INFLUXDB_TOKEN",
-        'BATCH_SIZE': 60,            # Number of readings to batch before sending
-        'SEND_INTERVAL_SEC': 60,     # Send (or retry) at most once per interval
+        'POINT_INTERVAL_SEC': 60,    # Average readings into one stored point per interval
+        'SEND_INTERVAL_SEC': 300,    # Upload queued points (or retry) once per interval
         'TIMEOUT_MS': 5000,          # HTTP timeout; a write blocks the main loop
     },
     'SENSOR_LOCATION': "bedroom3",   # Location tag for InfluxDB
     'CACHE': {
-        'MAX_SIZE': 3600,           # Readings kept in RAM while InfluxDB is unreachable (~1 hour)
+        'MAX_SIZE': 1440,           # Points kept in RAM while InfluxDB is unreachable (~24 hours)
     },
     'HEALTH_CHECK': {
         'TEMP_RANGE': (-10, 50),     # Valid temperature range in Celsius
@@ -260,6 +261,8 @@ class SensorManager:
         self.write_api = None
         self.running = True
         self.data_cache = deque(maxlen=CONFIG['CACHE']['MAX_SIZE'])
+        self.point_window = []  # Valid readings waiting to be averaged into a point
+        self.point_window_start = time.time()
         self.last_influx_send = 0
         self.health = SensorHealth()
         self.temp_history = deque(maxlen=WIDTH)  # One point per pixel column
@@ -319,6 +322,7 @@ class SensorManager:
         if self.influx_client:
             try:
                 logger.info("Saving final data to InfluxDB...")
+                self.close_point_window()
                 self.flush_cache()
                 self.influx_client.close()
             except Exception as e:
@@ -360,16 +364,53 @@ class SensorManager:
             return False
 
     def write_to_influx(self, sensor_data: Dict[str, Any]):
-        """Add data to cache and potentially send to InfluxDB"""
-        if not self.validate_data_point(sensor_data):
-            return
-
-        self.data_cache.append(sensor_data)
+        """Collect valid readings, average them into one point per interval, and
+        upload the queued points in a single request per send interval"""
+        if self.validate_data_point(sensor_data):
+            self.point_window.append(sensor_data)
 
         current_time = time.time()
-        if (current_time - self.last_influx_send >= CONFIG['INFLUXDB']['SEND_INTERVAL_SEC'] and
-            len(self.data_cache) >= CONFIG['INFLUXDB']['BATCH_SIZE']):
+        if current_time - self.point_window_start >= CONFIG['INFLUXDB']['POINT_INTERVAL_SEC']:
+            self.close_point_window()
+
+        if (self.data_cache and
+            current_time - self.last_influx_send >= CONFIG['INFLUXDB']['SEND_INTERVAL_SEC']):
             self.flush_cache()
+
+    def close_point_window(self):
+        """Average the readings collected this interval into one queued point"""
+        readings = self.point_window
+        self.point_window = []
+        self.point_window_start = time.time()
+        if not readings:
+            return
+
+        # aqi/tvoc/eco2 are stored as integers; keep them that way so the
+        # field types match existing data
+        aqi = round(mean(r['aqi'] for r in readings))
+        eco2 = round(mean(r['eco2'] for r in readings))
+        self.data_cache.append({
+            "tempC": mean(r['tempC'] for r in readings),
+            "pres_hPa": mean(r['pres_hPa'] for r in readings),
+            "humRH": mean(r['humRH'] for r in readings),
+            "aqi": aqi,
+            "aqi_rating": CONFIG['ENS160']['AQI_RATINGS'].get(aqi, 'Unknown'),
+            "tvoc": round(mean(r['tvoc'] for r in readings)),
+            "eco2": eco2,
+            "eco2_rating": self.eco2_rating(eco2),
+            "sensor_status": readings[-1]['sensor_status'],
+            "timestamp_ms": readings[-1]['timestamp_ms'],
+        })
+
+    @staticmethod
+    def eco2_rating(eco2: int) -> str:
+        """Same thresholds the PiicoDev_ENS160 driver uses for eco2.rating"""
+        if eco2 < 400:
+            return 'invalid'
+        for threshold, rating in ((1500, 'bad'), (1000, 'poor'), (800, 'fair'), (600, 'good')):
+            if eco2 > threshold:
+                return rating
+        return 'excellent'
 
     def flush_cache(self):
         """Attempt to send all cached data to InfluxDB"""
@@ -409,9 +450,9 @@ class SensorManager:
             )
 
             self.data_cache.clear()
-            logger.info(f"Successfully sent {len(points)} readings to InfluxDB")
+            logger.info(f"Successfully sent {len(points)} points to InfluxDB")
         except Exception as e:
-            logger.error(f"Error writing to InfluxDB ({len(self.data_cache)} readings kept for retry): {e}")
+            logger.error(f"Error writing to InfluxDB ({len(self.data_cache)} points kept for retry): {e}")
 
     def log_ens160_status(self, sensor_status: str):
         if sensor_status != self.last_ens160_status:
