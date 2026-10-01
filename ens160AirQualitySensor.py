@@ -326,6 +326,10 @@ class SensorManager:
             if not data['atmospheric_ok']:
                 return False
 
+            # Same for temperature: the BME280 fallback reads warm, so only store TMP117 values
+            if not data['temp_ok']:
+                return False
+
             checks = [
                 ('temperature', data['tempC'], CONFIG['HEALTH_CHECK']['TEMP_RANGE']),
                 ('humidity', data['humRH'], CONFIG['HEALTH_CHECK']['HUMID_RANGE']),
@@ -532,7 +536,7 @@ class SensorManager:
             "eco2_rating": eco2.rating,
             "sensor_status": sensor_status,
             "atmospheric_ok": atmospheric_ok,
-            "temp_ok": temp_sensor_ok or atmospheric_ok,
+            "temp_ok": temp_sensor_ok,  # False when tempC is the BME280 fallback
             "timestamp_ms": time.time_ns() // 1_000_000
         }
 

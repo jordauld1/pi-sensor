@@ -7,6 +7,13 @@ def test_graph_sampling_cadence(manager, good_reading):
     assert list(manager.temp_history) == [21.0, 21.0]
 
 
+def test_graph_skips_fallback_temperature(manager):
+    manager.temp_sensor.error = OSError()
+    reading = manager.read_sensors()
+    manager.sample_temp_history(reading, 1000)
+    assert len(manager.temp_history) == 0
+
+
 def test_page2_collecting_without_history(manager, good_reading):
     manager.update_display(manager.display, good_reading(), page=2)
     assert ("Collecting...", 0, 30) in manager.display.texts

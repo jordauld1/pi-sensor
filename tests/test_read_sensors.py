@@ -54,7 +54,14 @@ def test_tmp_failure_falls_back_to_bme(manager):
     manager.temp_sensor.error = OSError()
     reading = manager.read_sensors()
     assert reading["tempC"] == 21.5
+    assert reading["temp_ok"] is False
+
+
+def test_bme_failure_keeps_tmp117_temp_ok(manager):
+    manager.atmospheric_sensor.error = OSError()
+    reading = manager.read_sensors()
     assert reading["temp_ok"] is True
+    assert reading["atmospheric_ok"] is False
 
 
 def test_ens_failure_reuses_last_read(manager):

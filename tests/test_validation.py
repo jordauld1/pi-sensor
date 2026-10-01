@@ -27,6 +27,6 @@ def test_missing_tvoc_rejected(manager, good_reading):
     assert manager.validate_data_point(reading) is False
 
 
-def test_temperature_fallback_stored(manager, good_reading):
-    # Current behaviour: a TMP117 failure falls back to the BME280 temperature, which is still stored. See plans/README.md "Open questions".
-    assert manager.validate_data_point(good_reading(temp_ok=False, atmospheric_ok=True)) is True
+def test_temperature_fallback_not_stored(manager, good_reading):
+    # TMP117 fallback values are display-only (plan 011)
+    assert manager.validate_data_point(good_reading(temp_ok=False, atmospheric_ok=True)) is False

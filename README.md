@@ -171,7 +171,7 @@ Fields:  temperature, humidity, pressure, aqi, tvoc, eco2, aqi_rating, eco2_rati
 Time:    end of each averaging window (one point per POINT_INTERVAL_SEC), not upload time
 ```
 
-Each point is the mean of the valid readings in its window (aqi, tvoc and eco2 rounded to integers). Only readings taken while the ENS160 reports `operating ok` and all sensors read successfully are included.
+Each point is the mean of the valid readings in its window (aqi, tvoc and eco2 rounded to integers). Only readings taken while the ENS160 reports `operating ok` and every sensor read successfully are included; if the TMP117 or BME280 fails, the display carries on with fallback values but those readings aren't stored.
 
 ## Troubleshooting
 
