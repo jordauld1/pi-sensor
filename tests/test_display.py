@@ -23,5 +23,15 @@ def test_page2_graph_and_labels(manager, good_reading):
 
 def test_page4_word_wraps(manager, good_reading):
     manager.update_display(manager.display, good_reading(humRH=75.0), page=4)
-    assert ("Very humid:", 0, 26) in manager.display.texts
+    assert ("Too humid:", 0, 26) in manager.display.texts
     assert ("dehumidify", 0, 35) in manager.display.texts
+
+
+def test_page1_labels_eco2(manager, good_reading):
+    manager.update_display(manager.display, good_reading(), page=1)
+    assert ("eCO2:650ppm", 0, 35) in manager.display.texts
+
+
+def test_page4_moderate_aqi_recommends(manager, good_reading):
+    manager.update_display(manager.display, good_reading(aqi=3, aqi_rating="Moderate"), page=4)
+    assert ("Find VOC source", 0, 26) in manager.display.texts

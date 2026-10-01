@@ -76,6 +76,25 @@ CONFIG = {
         'UPDATE_INTERVAL_SEC': 3,  # Seconds between page changes
         'GRAPH_SAMPLE_INTERVAL_SEC': 60,  # One graph point per minute -> ~2 hours across the screen
     },
+    'ENVIRONMENT_RATINGS': {
+        # Sources and reasoning: docs/air-quality-guide.md. Keep the guide in sync with this table.
+        # Each rule is (threshold, severity, message); the first matching rule per list applies.
+        # Severity: 3 act now, 2 act soon, 1 advisory. Messages word-wrap at 16 characters per line.
+        'ECO2_ABOVE_PPM': [            # ENS160 datasheet Table 5 (Poor/Bad bands; same as eco2_rating())
+            (1500, 3, 'Ventilate now!'),
+            (1000, 2, 'Open a window'),
+            (800, 1, 'Get fresh air'),
+        ],
+        'AQI_AT_LEAST': [              # ENS160 AQI-UBA level (TVOC-based, UBA 2007 guidance)
+            (5, 3, 'VOCs high: air out'),
+            (4, 2, 'Ventilate: VOCs'),
+            (3, 1, 'Find VOC source'),
+        ],
+        'HUMIDITY_BELOW': [(30, 2, 'Too dry: humidify')],      # US EPA: ideally 30-50 %RH
+        'HUMIDITY_ABOVE': [(60, 2, 'Too humid: dehumidify')],  # US EPA: keep below 60 %RH
+        'TEMP_BELOW': [(18, 1, 'Too cold')],                   # WHO Housing and Health Guidelines 2018
+        'TEMP_ABOVE': [(26, 1, 'Too warm')],                   # ASHRAE 55 summer comfort upper bound
+    },
 }
 
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font-pet-me-128.dat")
@@ -191,65 +210,29 @@ class SensorHealth:
         return True
 
 class EnvironmentAnalyzer:
+    # (CONFIG['ENVIRONMENT_RATINGS'] key, reading key, comparison) in tie-break order
+    RULES = (
+        ('ECO2_ABOVE_PPM', 'eco2', lambda value, threshold: value > threshold),
+        ('AQI_AT_LEAST', 'aqi', lambda value, threshold: value >= threshold),
+        ('HUMIDITY_BELOW', 'humRH', lambda value, threshold: value < threshold),
+        ('HUMIDITY_ABOVE', 'humRH', lambda value, threshold: value > threshold),
+        ('TEMP_BELOW', 'tempC', lambda value, threshold: value < threshold),
+        ('TEMP_ABOVE', 'tempC', lambda value, threshold: value > threshold),
+    )
+
     @staticmethod
     def get_environment_score(sensor_data: Dict[str, Any]) -> Tuple[str, List[str]]:
-        # Use the actual AQI rating from ENS160 as our base score
-        base_score = sensor_data['aqi_rating']
-        recommendations = []
+        """Return the ENS160 AQI rating and up to 2 recommendations, most severe first."""
+        candidates = []  # (severity, message) in RULES order
+        for config_key, reading_key, matches in EnvironmentAnalyzer.RULES:
+            for threshold, severity, message in CONFIG['ENVIRONMENT_RATINGS'][config_key]:
+                if matches(sensor_data[reading_key], threshold):
+                    candidates.append((severity, message))
+                    break  # only the first (strongest) matching rule per list
 
-        # Check CO2 levels using more granular thresholds
-        eco2 = sensor_data['eco2']
-        if eco2 > 2000:
-            recommendations.append('Ventilate now!')
-        elif eco2 > 1200:
-            recommendations.append('Open windows')
-        elif eco2 > 800:
-            recommendations.append('Consider fresh air')
-
-        # Check TVOC levels with more granular thresholds
-        tvoc = sensor_data['tvoc']
-        if tvoc > 10000:
-            recommendations.append('Air purify now!')
-        elif tvoc > 2000:
-            recommendations.append('Ventilate space')
-        elif tvoc > 500:
-            recommendations.append('Check VOC sources')
-
-        # More sensitive humidity recommendations
-        humidity = sensor_data['humRH']
-        if humidity < 30:
-            recommendations.append('Too dry: humidify')
-        elif humidity < 40:
-            recommendations.append('Slightly dry')
-        elif humidity > 70:
-            recommendations.append('Very humid: dehumidify')
-        elif humidity > 60:
-            recommendations.append('Getting humid')
-
-        # Temperature comfort recommendations
-        temp = sensor_data['tempC']
-        if temp > 26:
-            recommendations.append('Space too warm')
-        elif temp < 17:
-            recommendations.append('Space too cool')
-
-        # Add AQI-based recommendations
-        if sensor_data['aqi'] >= 4:
-            recommendations.append('Poor air: purify!')
-
-        # Checks above are in priority order and never repeat, so keep the order
-        return base_score, recommendations[:2]
-
-    @staticmethod
-    def get_comfort_status(sensor_data: Dict[str, Any]) -> str:
-        """Get overall comfort status when no immediate actions needed"""
-        if (18 <= sensor_data['tempC'] <= 25 and
-            30 <= sensor_data['humRH'] <= 60 and
-            sensor_data['eco2'] < 800 and
-            sensor_data['tvoc'] < 500 and
-            sensor_data['aqi'] <= 2):
-            return "All parameters OK"
-        return "Monitor values"
+        # sorted() is stable, so equal severities keep RULES order
+        recommendations = [message for _, message in sorted(candidates, key=lambda c: -c[0])]
+        return sensor_data['aqi_rating'], recommendations[:2]
 
 class SensorManager:
     def __init__(self):
@@ -645,9 +628,9 @@ class SensorManager:
                     display.text(f"TVOC:{sensor_data['tvoc']}ppb", 0, 25, 1)
                     eco2_val = sensor_data['eco2']
                     if eco2_val > 9999:
-                        display.text(f"CO2:{eco2_val//1000}k", 0, 35, 1)
+                        display.text(f"eCO2:{eco2_val//1000}k", 0, 35, 1)
                     else:
-                        display.text(f"CO2:{eco2_val}ppm", 0, 35, 1)
+                        display.text(f"eCO2:{eco2_val}ppm", 0, 35, 1)
                 else:
                     display.text("Sensor not ready", 0, 25, 1)
                     status_text = sensor_data['sensor_status'][:CHARS_PER_LINE]
@@ -700,7 +683,7 @@ class SensorManager:
                     elif sensor_data['aqi'] == 2:
                         messages = ["Air quality good", "Keep ventilating"]
                     else:
-                        messages = [self.environment_analyzer.get_comfort_status(sensor_data)]
+                        messages = [sensor_data['aqi_rating']]
                 else:
                     messages = recommendations
 
