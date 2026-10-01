@@ -189,6 +189,19 @@ journalctl -u air-quality -f          # if running as service
 .venv/bin/python ens160AirQualitySensor.py 2>&1 | tee sensor.log  # if running directly
 ```
 
+## Development
+
+Tests run on any machine. The PiicoDev hardware drivers are stubbed, so no Pi is needed.
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt   # Windows: .venv\Scripts\python
+.venv/bin/python -m pyflakes ens160AirQualitySensor.py tests
+.venv/bin/python -m pytest -q
+```
+
+CI runs the same checks on every push (`.github/workflows/tests.yml`).
+
 ## Documentation
 
 - [Air Quality Reading Guide](docs/air-quality-guide.md) — Interpreting AQI, TVOC, and eCO2 values

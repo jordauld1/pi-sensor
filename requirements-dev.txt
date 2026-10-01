@@ -1,0 +1,4 @@
+# Dev/test dependencies. Not needed on the Pi. PiicoDev drivers are stubbed in tests/conftest.py.
+influxdb-client>=1.24.0
+pytest>=8
+pyflakes>=3
