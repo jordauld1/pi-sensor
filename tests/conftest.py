@@ -23,6 +23,7 @@ _stub_module("PiicoDev_SSD1306", create_PiicoDev_SSD1306=_Unavailable, WIDTH=128
 _stub_module("PiicoDev_ENS160", PiicoDev_ENS160=_Unavailable)
 _stub_module("PiicoDev_BME280", PiicoDev_BME280=_Unavailable)
 _stub_module("PiicoDev_TMP117", PiicoDev_TMP117=_Unavailable)
+_stub_module("PiicoDev_Buzzer", PiicoDev_Buzzer=_Unavailable)
 _stub_module("PiicoDev_Unified", sleep_ms=lambda ms: None)
 
 import ens160AirQualitySensor as app  # noqa: E402

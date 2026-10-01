@@ -1,3 +1,19 @@
+class FakeBuzzer:
+    """Stands in for PiicoDev_Buzzer. Records tones; set .result=1 to simulate an I2C failure."""
+    def __init__(self, volume=None):
+        self.volume = volume
+        self.tones = []
+        self.led = None
+        self.result = 0
+
+    def tone(self, freq, dur=0):
+        self.tones.append((freq, dur))
+        return self.result
+
+    def pwrLED(self, on):
+        self.led = on
+
+
 class FakeBME280:
     """Stands in for PiicoDev_BME280. values() -> (tempC, pressure Pa, humidity %RH)."""
     def __init__(self, values=(21.5, 101325.0, 45.0)):

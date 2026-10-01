@@ -8,6 +8,7 @@ Real-time indoor air quality and environmental monitoring using multiple sensors
 - **BME280** — Environmental Sensor (Temperature, Pressure, Humidity)
 - **TMP117** — High-Precision Temperature Sensor
 - **SSD1306** — 128×64 OLED Display
+- **PiicoDev Buzzer** (optional): audible CO2 alarm
 
 ## Features
 
@@ -116,6 +117,11 @@ Each Pi is configured with environment variables, so the code is the same in eve
 | `INFLUXDB_ORG` | `raider` | InfluxDB organisation |
 | `INFLUXDB_BUCKET` | `sensorData` | InfluxDB bucket |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every reading; `INFO` logs status changes, errors and one line per upload |
+| `CO2_ALARM_ENABLED` | `off` | Turns on the buzzer alarm |
+| `CO2_ALARM_TRIGGER_PPM` | `1500` | Alarm when eCO2 stays above this threshold |
+| `CO2_ALARM_CLEAR_PPM` | `1000` | Clear the alarm at or below this threshold |
+| `CO2_ALARM_SUSTAIN_SEC` | `120` | Seconds of sustained high eCO2 before alarming |
+| `CO2_ALARM_QUIET_HOURS` | `22-7` | Local hours without sound, or `off` |
 
 Timing and buffering (`MEASUREMENT_INTERVAL_MS`, `POINT_INTERVAL_SEC`, `SEND_INTERVAL_SEC`, `CACHE.MAX_SIZE`, `GRAPH_SAMPLE_INTERVAL_SEC`) are only set in `CONFIG`.
 
@@ -142,6 +148,13 @@ journalctl -u air-quality -f                       # look for "Location: <room>"
 ### Adding another room
 
 Clone the repo on the new Pi, follow Setup, then the steps above with a different `SENSOR_LOCATION`. Every room writes to the same bucket, separated by the `location` tag, so Grafana panels can filter or group by `location`.
+
+### CO2 alarm
+
+With a PiicoDev Buzzer connected and `CO2_ALARM_ENABLED=1`, the monitor beeps three times when eCO2 stays
+above 1500 ppm (the "Ventilate now!" band) for 2 minutes, then again every 10 minutes until it is back to 1000 ppm or below. During quiet hours
+(default 22:00 to 07:00, Pi local time) it stays silent and only shows a "CO2 HIGH" banner on the display.
+eCO2 is estimated from VOCs by the ENS160, so treat the alarm as a prompt to ventilate, not a safety device.
 
 ## InfluxDB Data Schema
 

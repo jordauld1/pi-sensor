@@ -13,6 +13,7 @@ from PiicoDev_SSD1306 import create_PiicoDev_SSD1306, WIDTH, HEIGHT
 from PiicoDev_ENS160 import PiicoDev_ENS160
 from PiicoDev_BME280 import PiicoDev_BME280
 from PiicoDev_TMP117 import PiicoDev_TMP117
+from PiicoDev_Buzzer import PiicoDev_Buzzer
 from PiicoDev_Unified import sleep_ms
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -76,6 +77,19 @@ CONFIG = {
         'UPDATE_INTERVAL_SEC': 3,  # Seconds between page changes
         'GRAPH_SAMPLE_INTERVAL_SEC': 60,  # One graph point per minute -> ~2 hours across the screen
     },
+    'CO2_ALARM': {
+        'ENABLED': False,         # Opt in per room: CO2_ALARM_ENABLED=1
+        'TRIGGER_PPM': 1500,      # Alarm when eCO2 is ABOVE this; same as ENVIRONMENT_RATINGS ECO2_ABOVE_PPM top band
+        'CLEAR_PPM': 1000,        # Clear when eCO2 is at or below this; must be below TRIGGER_PPM
+        'SUSTAIN_SEC': 120,       # eCO2 must stay above TRIGGER_PPM this long before alarming
+        'MAX_GAP_SEC': 30,        # A longer gap without usable readings restarts the sustain timer
+        'REPEAT_SEC': 600,        # Beep again this often while still high
+        'QUIET_HOURS': (22, 7),   # Local hours [start, end) with no sound (banner only); None = never quiet
+        'TONE_HZ': 2000,
+        'TONE_MS': 150,
+        'BEEPS': 3,
+        'VOLUME': 1,              # PiicoDev buzzer volume: 0, 1 or 2
+    },
     'ENVIRONMENT_RATINGS': {
         # Sources and reasoning: docs/air-quality-guide.md. Keep the guide in sync with this table.
         # Each rule is (threshold, severity, message); the first matching rule per list applies.
@@ -108,6 +122,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def on_off(raw: str) -> bool:
+    """Parse 1/0, true/false, yes/no, on/off."""
+    value = raw.strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError(raw)
+
+
+def quiet_hours(raw: str):
+    """Parse 'START-END' local hours (e.g. '22-7'), or 'off' for no quiet hours."""
+    if raw.strip().lower() in ('off', 'none'):
+        return None
+    start, end = (int(part) for part in raw.split('-'))
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        raise ValueError(raw)
+    return (start, end)
+
+
 # Environment variables that override CONFIG, so one copy of this script can run in any room.
 # name -> (path of keys into CONFIG, function converting the string value)
 ENV_OVERRIDES = {
@@ -115,6 +149,11 @@ ENV_OVERRIDES = {
     'INFLUXDB_URL': (('INFLUXDB', 'URL'), str),
     'INFLUXDB_ORG': (('INFLUXDB', 'ORG'), str),
     'INFLUXDB_BUCKET': (('INFLUXDB', 'BUCKET'), str),
+    'CO2_ALARM_ENABLED': (('CO2_ALARM', 'ENABLED'), on_off),
+    'CO2_ALARM_TRIGGER_PPM': (('CO2_ALARM', 'TRIGGER_PPM'), int),
+    'CO2_ALARM_CLEAR_PPM': (('CO2_ALARM', 'CLEAR_PPM'), int),
+    'CO2_ALARM_SUSTAIN_SEC': (('CO2_ALARM', 'SUSTAIN_SEC'), int),
+    'CO2_ALARM_QUIET_HOURS': (('CO2_ALARM', 'QUIET_HOURS'), quiet_hours),
 }
 
 
@@ -265,6 +304,61 @@ class EnvironmentAnalyzer:
         recommendations = [message for _, message in sorted(candidates, key=lambda c: -c[0])]
         return sensor_data['aqi_rating'], recommendations[:2]
 
+class Co2Alarm:
+    """Decides when to sound the CO2 alarm. Pure logic: the caller does the beeping."""
+
+    def __init__(self, settings: Dict[str, Any]):
+        # Only validate when enabled, so a bad pair in a room with the alarm off can't stop startup
+        if settings['ENABLED'] and settings['CLEAR_PPM'] >= settings['TRIGGER_PPM']:
+            raise ValueError("CO2_ALARM CLEAR_PPM must be below TRIGGER_PPM")
+        self.settings = settings
+        self.active = False
+        self.high_since = None    # when eCO2 first went above TRIGGER_PPM in this episode
+        self.last_sounded = None
+        self.last_usable = None   # time of the last reading we could trust
+
+    def in_quiet_hours(self, local_hour: int) -> bool:
+        hours = self.settings['QUIET_HOURS']
+        if hours is None:
+            return False
+        start, end = hours
+        if start <= end:
+            return start <= local_hour < end
+        return local_hour >= start or local_hour < end   # wraps past midnight
+
+    def update(self, reading: Dict[str, Any], now: float, local_hour: int) -> bool:
+        """Feed one reading. Returns True when the buzzer should sound now."""
+        if reading['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
+            return False  # warm-up or failed read: don't trigger, clear or reset timers
+        if self.last_usable is not None and now - self.last_usable > self.settings['MAX_GAP_SEC']:
+            self.high_since = None  # too long without trustworthy data to call the level "sustained"
+        self.last_usable = now
+
+        eco2 = reading['eco2']
+        if self.active:
+            if eco2 <= self.settings['CLEAR_PPM']:
+                logger.info(f"CO2 alarm cleared (eCO2 {eco2} ppm)")
+                self.active = False
+                self.high_since = None
+                self.last_sounded = None
+                return False
+        elif eco2 > self.settings['TRIGGER_PPM']:
+            if self.high_since is None:
+                self.high_since = now
+            if now - self.high_since >= self.settings['SUSTAIN_SEC']:
+                logger.warning(f"CO2 alarm: eCO2 {eco2} ppm for {now - self.high_since:.0f}s")
+                self.active = True
+        else:
+            self.high_since = None
+
+        if not self.active or self.in_quiet_hours(local_hour):
+            return False
+        if self.last_sounded is None or now - self.last_sounded >= self.settings['REPEAT_SEC']:
+            self.last_sounded = now
+            return True
+        return False
+
+
 class SensorManager:
     def __init__(self):
         self.temp_sensor = None
@@ -284,6 +378,8 @@ class SensorManager:
         self.last_ens160_status = None
         self.environment_analyzer = EnvironmentAnalyzer()
         self.current_page = 0
+        self.buzzer = None
+        self.co2_alarm = Co2Alarm(CONFIG['CO2_ALARM'])
 
     def init_influxdb(self):
         token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
@@ -314,10 +410,35 @@ class SensorManager:
             self.display.show()
             sleep_ms(1000)
 
+            self.init_buzzer()
             logger.info("All sensors initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize devices: {e}")
             raise
+
+    def init_buzzer(self):
+        """Connect the buzzer if the CO2 alarm is enabled. A missing buzzer is not fatal."""
+        if not CONFIG['CO2_ALARM']['ENABLED']:
+            return
+        try:
+            self.buzzer = PiicoDev_Buzzer(volume=CONFIG['CO2_ALARM']['VOLUME'])
+            self.buzzer.pwrLED(False)  # no glowing LED in a bedroom
+            logger.info("CO2 alarm enabled with buzzer")
+        except Exception as e:
+            self.buzzer = None
+            logger.warning(f"CO2 alarm enabled but buzzer not available, banner only: {e}")
+
+    def check_co2_alarm(self, sensor_data: Dict[str, Any], now: float, local_hour: int):
+        """Update CO2 alarm state and beep when it's due."""
+        if not CONFIG['CO2_ALARM']['ENABLED']:
+            return
+        if self.co2_alarm.update(sensor_data, now, local_hour) and self.buzzer is not None:
+            settings = CONFIG['CO2_ALARM']
+            for _ in range(settings['BEEPS']):
+                if self.buzzer.tone(settings['TONE_HZ'], settings['TONE_MS']) != 0:
+                    logger.warning("Buzzer did not respond")
+                    break
+                sleep_ms(settings['TONE_MS'] * 2)
 
     def cleanup(self):
         logger.info("Cleaning up resources...")
@@ -730,6 +851,10 @@ class SensorManager:
                         y += 9
                     y += 2
 
+            if self.co2_alarm.active:
+                # Banner over the title row on every page while the alarm is active
+                display.fill_rect(0, 0, WIDTH - 1, 9, 1)
+                display.text("! CO2 HIGH !", 16, 1, 0)
             display.show()
 
         except Exception as e:
@@ -750,6 +875,7 @@ class SensorManager:
                 sensor_data = self.read_sensors()
                 self.update_console(sensor_data)
                 self.sample_temp_history(sensor_data, current_time)
+                self.check_co2_alarm(sensor_data, current_time, time.localtime(current_time).tm_hour)
 
                 # Show startup message on first successful reading
                 if not startup_message_shown and sensor_data['sensor_status'] == CONFIG['ENS160']['STATUS']['OK']:
