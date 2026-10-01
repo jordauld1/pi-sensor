@@ -108,6 +108,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Environment variables that override CONFIG, so one copy of this script can run in any room.
+# name -> (path of keys into CONFIG, function converting the string value)
+ENV_OVERRIDES = {
+    'SENSOR_LOCATION': (('SENSOR_LOCATION',), str),
+    'INFLUXDB_URL': (('INFLUXDB', 'URL'), str),
+    'INFLUXDB_ORG': (('INFLUXDB', 'ORG'), str),
+    'INFLUXDB_BUCKET': (('INFLUXDB', 'BUCKET'), str),
+}
+
+
+def apply_env_overrides(config: Dict[str, Any], environ) -> List[str]:
+    """Apply ENV_OVERRIDES found in environ to config, in place. Returns the names applied.
+
+    Empty values are ignored. Raises ValueError if a value can't be converted."""
+    applied = []
+    for name, (path, convert) in ENV_OVERRIDES.items():
+        raw = environ.get(name, '').strip()
+        if not raw:
+            continue
+        try:
+            value = convert(raw)
+        except ValueError:
+            raise ValueError(f"Environment variable {name} has an invalid value")
+        target = config
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        applied.append(name)
+    return applied
+
+
 def patch_display_driver():
     """Speed up the PiicoDev SSD1306 driver on Linux.
 
@@ -759,6 +790,13 @@ class SensorManager:
                 sleep_ms(5000)  # Wait before retrying
 
 def main():
+    try:
+        applied = apply_env_overrides(CONFIG, os.environ)
+    except ValueError as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
+    logger.info(f"Config overrides from environment: {', '.join(applied) or 'none'}")
+    logger.info(f"Location: {CONFIG['SENSOR_LOCATION']}, InfluxDB: {CONFIG['INFLUXDB']['URL']}")
     sensor_manager = SensorManager()
 
     def signal_handler(signum, frame):

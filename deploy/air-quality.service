@@ -1,0 +1,18 @@
+# Copy to /etc/systemd/system/air-quality.service.
+# Edit User and the /home/pi/pi-sensor paths if your user or checkout location differs.
+[Unit]
+Description=Air quality monitor (ENS160, BME280, TMP117, SSD1306)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pi-sensor
+EnvironmentFile=/etc/pi-sensor.env
+ExecStart=/home/pi/pi-sensor/.venv/bin/python /home/pi/pi-sensor/ens160AirQualitySensor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

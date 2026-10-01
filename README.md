@@ -24,6 +24,7 @@ Real-time indoor air quality and environmental monitoring using multiple sensors
 pi-sensor/
 ├── ens160AirQualitySensor.py    # Main monitoring application
 ├── requirements.txt
+├── deploy/                      # systemd unit + per-room env file template
 ├── docs/
 │   ├── air-quality-guide.md     # Interpreting sensor readings
 │   ├── ENS160.md                # ENS160 sensor reference
@@ -105,25 +106,18 @@ After an OS upgrade that changes the Python version, recreate it: `rm -rf .venv`
 
 ### Configuration
 
-Edit the `CONFIG` dictionary in `ens160AirQualitySensor.py`:
+Each Pi is configured with environment variables, so the code is the same in every room. Defaults are in `CONFIG` in `ens160AirQualitySensor.py`.
 
-```python
-CONFIG = {
-    'MEASUREMENT_INTERVAL_MS': 1000,     # Sensor/display refresh rate
-    'INFLUXDB': {
-        'URL': "http://your-influx-server:8086",
-        'ORG': "your-org",
-        'BUCKET': "sensorData",
-        'POINT_INTERVAL_SEC': 60,        # Readings are averaged into one point per minute
-        'SEND_INTERVAL_SEC': 300,        # Queued points are uploaded in one request every 5 minutes
-    },
-    'SENSOR_LOCATION': "room-name",
-    'CACHE': {'MAX_SIZE': 1440},         # Points buffered while InfluxDB is unreachable (~24h)
-    'DISPLAY': {'GRAPH_SAMPLE_INTERVAL_SEC': 60},  # Temp graph spans 128 samples
-}
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `INFLUXDB_TOKEN` | (required) | InfluxDB token; write-only access to the bucket is enough |
+| `SENSOR_LOCATION` | `bedroom3` | Room name, stored as the `location` tag |
+| `INFLUXDB_URL` | `http://192.168.1.10:8086` | InfluxDB server |
+| `INFLUXDB_ORG` | `raider` | InfluxDB organisation |
+| `INFLUXDB_BUCKET` | `sensorData` | InfluxDB bucket |
+| `LOG_LEVEL` | `INFO` | `DEBUG` logs every reading; `INFO` logs status changes, errors and one line per upload |
 
-Set `LOG_LEVEL=DEBUG` to log every reading; the default `INFO` only logs status changes, errors, and one line per upload.
+Timing and buffering (`MEASUREMENT_INTERVAL_MS`, `POINT_INTERVAL_SEC`, `SEND_INTERVAL_SEC`, `CACHE.MAX_SIZE`, `GRAPH_SAMPLE_INTERVAL_SEC`) are only set in `CONFIG`.
 
 ### Run
 
@@ -133,34 +127,21 @@ Set `LOG_LEVEL=DEBUG` to log every reading; the default `INFO` only logs status 
 
 ### Run as a Service (optional)
 
-Keep the token out of the unit file (unit files are world-readable, and `systemctl show` prints their environment):
+Settings and the token live in `/etc/pi-sensor.env`, readable only by root. Unit files are world-readable and `systemctl show` prints their environment, so don't put the token in the unit file.
 
 ```bash
-echo 'INFLUXDB_TOKEN=your-token-here' | sudo tee /etc/pi-sensor.env
-sudo chmod 600 /etc/pi-sensor.env
-sudo nano /etc/systemd/system/air-quality.service
+sudo install -m 600 -o root -g root deploy/pi-sensor.env.example /etc/pi-sensor.env
+sudo nano /etc/pi-sensor.env                       # set INFLUXDB_TOKEN and SENSOR_LOCATION
+sudo cp deploy/air-quality.service /etc/systemd/system/
+sudo nano /etc/systemd/system/air-quality.service  # only if your user or path isn't pi / ~/pi-sensor
+sudo systemctl daemon-reload
+sudo systemctl enable --now air-quality
+journalctl -u air-quality -f                       # look for "Location: <room>"
 ```
 
-```ini
-[Unit]
-Description=Air Quality Monitoring
-After=network.target
+### Adding another room
 
-[Service]
-EnvironmentFile=/etc/pi-sensor.env
-ExecStart=/path/to/pi-sensor/.venv/bin/python /path/to/pi-sensor/ens160AirQualitySensor.py
-WorkingDirectory=/path/to/pi-sensor
-Restart=always
-User=pi
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable air-quality
-sudo systemctl start air-quality
-```
+Clone the repo on the new Pi, follow Setup, then the steps above with a different `SENSOR_LOCATION`. Every room writes to the same bucket, separated by the `location` tag, so Grafana panels can filter or group by `location`.
 
 ## InfluxDB Data Schema
 
