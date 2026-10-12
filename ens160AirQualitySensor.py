@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import signal
@@ -32,6 +33,7 @@ CONFIG = {
         'TIMEOUT_MS': 5000,          # HTTP timeout; a write blocks the main loop
     },
     'SENSOR_LOCATION': "bedroom3",   # Location tag for InfluxDB
+    'LATEST_READING_PATH': "",       # If set, each averaged point is also written here as JSON
     'CACHE': {
         'MAX_SIZE': 1440,           # Points kept in RAM while InfluxDB is unreachable (~24 hours)
     },
@@ -146,6 +148,7 @@ def quiet_hours(raw: str):
 # name -> (path of keys into CONFIG, function converting the string value)
 ENV_OVERRIDES = {
     'SENSOR_LOCATION': (('SENSOR_LOCATION',), str),
+    'LATEST_READING_PATH': (('LATEST_READING_PATH',), str),
     'INFLUXDB_URL': (('INFLUXDB', 'URL'), str),
     'INFLUXDB_ORG': (('INFLUXDB', 'ORG'), str),
     'INFLUXDB_BUCKET': (('INFLUXDB', 'BUCKET'), str),
@@ -540,6 +543,29 @@ class SensorManager:
             "sensor_status": readings[-1]['sensor_status'],
             "timestamp_ms": readings[-1]['timestamp_ms'],
         })
+        self.write_latest_reading(self.data_cache[-1])
+
+    @staticmethod
+    def write_latest_reading(point: Dict[str, Any]):
+        """Write the latest averaged point to LATEST_READING_PATH for other programs
+        on this Pi (e.g. room_control.py in actron-local). Does nothing if unset."""
+        path = CONFIG['LATEST_READING_PATH']
+        if not path:
+            return
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump({
+                    "location": CONFIG['SENSOR_LOCATION'],
+                    "time": time.time(),
+                    "tempC": round(point['tempC'], 2),
+                    "humRH": round(point['humRH'], 1),
+                    "eco2": point['eco2'],
+                }, f)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning(f"Couldn't write latest reading to {path}: {e}")
 
     @staticmethod
     def eco2_rating(eco2: int) -> str:
