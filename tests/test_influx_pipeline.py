@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import ens160AirQualitySensor as app
@@ -102,3 +104,28 @@ def test_cleanup_saves_partial_window(manager, good_reading, clock):
 
 def test_cache_holds_24h_of_points(manager):
     assert manager.data_cache.maxlen == 1440
+
+
+def test_latest_reading_file_written(manager, good_reading, clock, monkeypatch, tmp_path):
+    path = tmp_path / "latest.json"
+    monkeypatch.setitem(app.CONFIG, "LATEST_READING_PATH", str(path))
+    manager.write_to_influx(good_reading(tempC=20.0))
+    clock.now += 30
+    manager.write_to_influx(good_reading(tempC=22.0))
+    clock.now += 30
+    manager.write_to_influx(good_reading())
+    data = json.loads(path.read_text())
+    assert data["tempC"] == 21.0
+    assert data["location"] == app.CONFIG["SENSOR_LOCATION"]
+    assert data["time"] == clock.now
+    assert not (tmp_path / "latest.json.tmp").exists()
+
+
+def test_latest_reading_file_off_by_default(manager, good_reading, clock, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    manager.last_influx_send = clock.now
+    manager.write_to_influx(good_reading())
+    clock.now += 60
+    manager.write_to_influx(good_reading())
+    assert len(manager.data_cache) == 1
+    assert list(tmp_path.iterdir()) == []

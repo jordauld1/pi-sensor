@@ -156,6 +156,16 @@ above 1500 ppm (the "Ventilate now!" band) for 2 minutes, then again every 10 mi
 (default 22:00 to 07:00, Pi local time) it stays silent and only shows a "CO2 HIGH" banner on the display.
 eCO2 is estimated from VOCs by the ENS160, so treat the alarm as a prompt to ventilate, not a safety device.
 
+### Latest reading for other programs
+
+Set `LATEST_READING_PATH` (e.g. `/run/pi-sensor/latest.json`) and each averaged point is also written there, once per `POINT_INTERVAL_SEC`:
+
+```json
+{"location": "bedroom3", "time": 1760266800.1, "tempC": 22.84, "humRH": 51.2, "eco2": 612}
+```
+
+`time` is Unix seconds when the point was closed; treat the reading as stale if it is more than a few minutes old. The file is replaced atomically and is world-readable, so readers never see a half-written file. The aircon's per-room control (`room_control.py` in [actron-local](https://github.com/jordauld1/actron-local)) reads it. The service's `RuntimeDirectory=pi-sensor` creates `/run/pi-sensor` on start.
+
 ## InfluxDB Data Schema
 
 ```

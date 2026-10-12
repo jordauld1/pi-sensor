@@ -10,6 +10,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/pi-sensor
 EnvironmentFile=/etc/pi-sensor.env
+RuntimeDirectory=pi-sensor
 ExecStart=/home/pi/pi-sensor/.venv/bin/python /home/pi/pi-sensor/ens160AirQualitySensor.py
 Restart=always
 RestartSec=10
