@@ -153,7 +153,9 @@ Clone the repo on the new Pi, follow Setup, then the steps above with a differen
 
 With a PiicoDev Buzzer connected and `CO2_ALARM_ENABLED=1`, the monitor beeps three times when eCO2 stays
 above 1500 ppm (the "Ventilate now!" band) for 2 minutes, then again every 10 minutes until it is back to 1000 ppm or below. During quiet hours
-(default 22:00 to 07:00, Pi local time) it stays silent and only shows a "CO2 HIGH" banner on the display.
+(default 22:00 to 07:00, Pi local time) it stays silent. While the alarm is on, the display drops its usual pages
+for a full-screen alert with the current eCO2, how long it has been high and the level it clears at. The alert
+flashes once a second, except in quiet hours, where it stays steady so it doesn't light up a dark room.
 eCO2 is estimated from VOCs by the ENS160, so treat the alarm as a prompt to ventilate, not a safety device.
 
 ### Latest reading for other programs

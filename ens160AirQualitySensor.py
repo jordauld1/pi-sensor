@@ -7,6 +7,7 @@ import textwrap
 import time
 from typing import Dict, Any, Tuple, List
 from collections import deque
+from functools import lru_cache
 from statistics import mean
 
 import PiicoDev_SSD1306 as ssd1306_driver
@@ -86,9 +87,9 @@ CONFIG = {
         'SUSTAIN_SEC': 120,       # eCO2 must stay above TRIGGER_PPM this long before alarming
         'MAX_GAP_SEC': 30,        # A longer gap without usable readings restarts the sustain timer
         'REPEAT_SEC': 600,        # Beep again this often while still high
-        'QUIET_HOURS': (22, 7),   # Local hours [start, end) with no sound (banner only); None = never quiet
+        'QUIET_HOURS': (22, 7),   # Local hours [start, end) with no sound (steady alert only); None = never quiet
         'TONE_HZ': 2000,
-        'TONE_MS': 150,
+        'TONE_MS': 300,           # Each beep; the pause between beeps is the same length
         'BEEPS': 3,
         'VOLUME': 1,              # PiicoDev buzzer volume: 0, 1 or 2
     },
@@ -181,6 +182,33 @@ def apply_env_overrides(config: Dict[str, Any], environ) -> List[str]:
     return applied
 
 
+@lru_cache(maxsize=None)
+def load_font() -> bytes:
+    """The 8x8 display font: 8 column bytes per character, starting at ASCII 32."""
+    with open(FONT_PATH, 'rb') as f:
+        return f.read()
+
+
+def draw_big_text(display, text, x, y, c=1, scale=2):
+    """Draw text at `scale` times the normal font size. The caller keeps it on screen."""
+    font = load_font()
+    for text_index, char in enumerate(text):
+        base = (ord(char) - 32) * 8
+        if base < 0 or base + 8 > len(font):
+            continue  # Character not in the font
+        for col in range(8):
+            bits = font[base + col]
+            for i in range(7):
+                if bits & (1 << i):
+                    for dx in range(scale):
+                        for dy in range(scale):
+                            display.pixel(x + (text_index * 8 + col) * scale + dx, y + i * scale + dy, c)
+
+
+def centred_x(text: str) -> int:
+    return max(0, (WIDTH - len(text) * 8) // 2)
+
+
 def patch_display_driver():
     """Speed up the PiicoDev SSD1306 driver on Linux.
 
@@ -192,8 +220,7 @@ def patch_display_driver():
     if getattr(ssd1306_driver, '_SYSNAME', None) != 'Linux':
         return
 
-    with open(FONT_PATH, 'rb') as f:
-        font = f.read()
+    font = load_font()
 
     def pixel(self, x, y, color):
         x = x & (WIDTH - 1)
@@ -319,6 +346,9 @@ class Co2Alarm:
         self.high_since = None    # when eCO2 first went above TRIGGER_PPM in this episode
         self.last_sounded = None
         self.last_usable = None   # time of the last reading we could trust
+        self.last_eco2 = None     # eCO2 from that reading
+        self.high_started = None  # when eCO2 went high in the episode that set off the alarm
+        self.quiet = False        # whether the last update fell in quiet hours
 
     def in_quiet_hours(self, local_hour: int) -> bool:
         hours = self.settings['QUIET_HOURS']
@@ -331,6 +361,7 @@ class Co2Alarm:
 
     def update(self, reading: Dict[str, Any], now: float, local_hour: int) -> bool:
         """Feed one reading. Returns True when the buzzer should sound now."""
+        self.quiet = self.in_quiet_hours(local_hour)
         if reading['sensor_status'] != CONFIG['ENS160']['STATUS']['OK']:
             return False  # warm-up or failed read: don't trigger, clear or reset timers
         if self.last_usable is not None and now - self.last_usable > self.settings['MAX_GAP_SEC']:
@@ -338,6 +369,7 @@ class Co2Alarm:
         self.last_usable = now
 
         eco2 = reading['eco2']
+        self.last_eco2 = eco2
         if self.active:
             if eco2 <= self.settings['CLEAR_PPM']:
                 logger.info(f"CO2 alarm cleared (eCO2 {eco2} ppm)")
@@ -351,10 +383,11 @@ class Co2Alarm:
             if now - self.high_since >= self.settings['SUSTAIN_SEC']:
                 logger.warning(f"CO2 alarm: eCO2 {eco2} ppm for {now - self.high_since:.0f}s")
                 self.active = True
+                self.high_started = self.high_since
         else:
             self.high_since = None
 
-        if not self.active or self.in_quiet_hours(local_hour):
+        if not self.active or self.quiet:
             return False
         if self.last_sounded is None or now - self.last_sounded >= self.settings['REPEAT_SEC']:
             self.last_sounded = now
@@ -383,6 +416,7 @@ class SensorManager:
         self.current_page = 0
         self.buzzer = None
         self.co2_alarm = Co2Alarm(CONFIG['CO2_ALARM'])
+        self.alert_inverted = False
 
     def init_influxdb(self):
         token = os.environ.get(CONFIG['INFLUXDB']['TOKEN_ENV_VAR'])
@@ -429,7 +463,7 @@ class SensorManager:
             logger.info("CO2 alarm enabled with buzzer")
         except Exception as e:
             self.buzzer = None
-            logger.warning(f"CO2 alarm enabled but buzzer not available, banner only: {e}")
+            logger.warning(f"CO2 alarm enabled but buzzer not available, display alert only: {e}")
 
     def check_co2_alarm(self, sensor_data: Dict[str, Any], now: float, local_hour: int):
         """Update CO2 alarm state and beep when it's due."""
@@ -782,8 +816,34 @@ class SensorManager:
         except Exception as e:
             logger.error(f"Critical display error: {e}")
 
+    def draw_co2_alert(self, display):
+        """Full-screen CO2 alarm. Flashes on every refresh, but holds steady in quiet hours."""
+        alarm = self.co2_alarm
+        self.alert_inverted = not self.alert_inverted and not alarm.quiet
+        c = 0 if self.alert_inverted else 1
+        display.fill(1 - c)
+
+        display.text("CO2 ALARM", centred_x("CO2 ALARM"), 0, c)
+        eco2 = alarm.last_eco2
+        number = f"{eco2 // 1000}k" if eco2 > 9999 else str(eco2)
+        x = (WIDTH - len(number) * 16 - 3 * 8) // 2
+        draw_big_text(display, number, x, 11, c)
+        display.text("ppm", x + len(number) * 16, 18, c)
+
+        minutes = int(alarm.last_usable - alarm.high_started) // 60
+        lines = [f"High for {minutes} min", "Open a window",
+                 "Quiet hrs: muted" if alarm.quiet else f"Clears <={CONFIG['CO2_ALARM']['CLEAR_PPM']}ppm"]
+        for line, y in zip(lines, (30, 41, 52)):
+            display.text(line, centred_x(line), y, c)
+        display.show()
+
     def update_display(self, display, sensor_data, page=0):
         try:
+            if self.co2_alarm.active:
+                # The alarm takes over the screen; pages keep turning underneath and return when it clears
+                self.draw_co2_alert(display)
+                return
+
             display.fill(0)
 
             if page == 0:
@@ -877,10 +937,6 @@ class SensorManager:
                         y += 9
                     y += 2
 
-            if self.co2_alarm.active:
-                # Banner over the title row on every page while the alarm is active
-                display.fill_rect(0, 0, WIDTH - 1, 9, 1)
-                display.text("! CO2 HIGH !", 16, 1, 0)
             display.show()
 
         except Exception as e:

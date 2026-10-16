@@ -124,7 +124,7 @@ def test_check_co2_alarm_beeps(monkeypatch, manager, good_reading):
     manager.buzzer = FakeBuzzer()
     manager.co2_alarm = app.Co2Alarm(dict(app.CONFIG['CO2_ALARM'], QUIET_HOURS=None, SUSTAIN_SEC=0))
     manager.check_co2_alarm(good_reading(eco2=2500), 0, 12)
-    assert manager.buzzer.tones == [(2000, 150)] * 3
+    assert manager.buzzer.tones == [(2000, 300)] * 3
 
 
 def test_buzzer_failure_stops_pattern(monkeypatch, manager, good_reading):
@@ -133,7 +133,7 @@ def test_buzzer_failure_stops_pattern(monkeypatch, manager, good_reading):
     manager.buzzer.result = 1
     manager.co2_alarm = app.Co2Alarm(dict(app.CONFIG['CO2_ALARM'], QUIET_HOURS=None, SUSTAIN_SEC=0))
     manager.check_co2_alarm(good_reading(eco2=2500), 0, 12)
-    assert manager.buzzer.tones == [(2000, 150)]
+    assert manager.buzzer.tones == [(2000, 300)]
 
 
 def test_disabled_does_nothing(manager, good_reading):
@@ -162,16 +162,66 @@ def test_init_buzzer(monkeypatch, manager):
     assert manager.buzzer is None
 
 
-def test_banner_when_active(manager, good_reading):
-    manager.co2_alarm.active = True
+def raise_alarm(manager, good_reading, local_hour=12, eco2=2500):
+    manager.co2_alarm = app.Co2Alarm(dict(app.CONFIG['CO2_ALARM'], ENABLED=True, QUIET_HOURS=(22, 7)))
+    for now in range(0, 721, 10):
+        manager.co2_alarm.update(good_reading(eco2=eco2), now, local_hour)
+    assert manager.co2_alarm.active
+
+
+def test_alarm_remembers_episode(alarm, good_reading):
+    sustain(alarm, good_reading)
+    assert alarm.high_started == 0
+    assert alarm.last_eco2 == 2500
+    assert not alarm.quiet
+    alarm.update(good_reading(eco2=1800), 130, 23)
+    assert alarm.last_eco2 == 1800
+    assert alarm.quiet is False  # QUIET_HOURS=None in this fixture
+
+
+def test_alert_takes_over_screen(manager, good_reading):
+    raise_alarm(manager, good_reading)
     manager.update_display(manager.display, good_reading(), page=0)
-    assert ('! CO2 HIGH !', 16, 1) in manager.display.texts
-    assert ('fill_rect', 0, 0, 127, 9, 1) in manager.display.calls
-    manager.display.calls.clear()
-    manager.co2_alarm.active = False
+    texts = [t[0] for t in manager.display.texts]
+    assert texts == ["CO2 ALARM", "ppm", "High for 12 min", "Open a window", "Clears <=1000ppm"]
+    assert any(call[0] == "pixel" for call in manager.display.calls)  # the big eCO2 number
+    assert manager.display.shown == 1
+
+
+def test_alert_flashes(manager, good_reading):
+    raise_alarm(manager, good_reading)
+    fills = []
+    for _ in range(4):
+        manager.display.calls.clear()
+        manager.update_display(manager.display, good_reading(), page=0)
+        fills.append(manager.display.calls[0])
+        text_colours = {call[4] for call in manager.display.calls if call[0] == "text"}
+        assert text_colours == {1 - fills[-1][1]}
+    assert fills == [("fill", 1), ("fill", 0), ("fill", 1), ("fill", 0)]
+
+
+def test_alert_steady_in_quiet_hours(manager, good_reading):
+    raise_alarm(manager, good_reading, local_hour=23)
+    for _ in range(3):
+        manager.display.calls.clear()
+        manager.update_display(manager.display, good_reading(), page=0)
+        assert manager.display.calls[0] == ("fill", 0)
+    assert ("Quiet hrs: muted", 0, 52) in manager.display.texts
+
+
+def test_alert_shows_large_values_in_thousands(manager, good_reading):
+    raise_alarm(manager, good_reading, eco2=12000)
     manager.update_display(manager.display, good_reading(), page=0)
-    assert ('! CO2 HIGH !', 16, 1) not in manager.display.texts
-    assert ('fill_rect', 0, 0, 127, 9, 1) not in manager.display.calls
+    xs = [call[1] for call in manager.display.calls if call[0] == "pixel"]
+    assert 0 <= min(xs) and max(xs) < app.WIDTH
+
+
+def test_pages_return_when_alarm_clears(manager, good_reading):
+    raise_alarm(manager, good_reading)
+    manager.co2_alarm.update(good_reading(eco2=900), 730, 12)
+    manager.update_display(manager.display, good_reading(), page=0)
+    assert ("Main Stats", 0, 0) in manager.display.texts
+    assert ("CO2 ALARM", 28, 0) not in manager.display.texts
 
 
 def test_env_converters():
